@@ -22,13 +22,13 @@ pub enum SearchExit {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchResult<M> {
-    best: M,
-    value: f32,
-    exit: SearchExit,
-    nodes: u32,
-    terminals: u32,
-    time: Duration,
-    depth: u8,
+    pub best: M,
+    pub value: f32,
+    pub exit: SearchExit,
+    pub nodes: u32,
+    pub terminals: u32,
+    pub time: Duration,
+    pub depth: u8,
 }
 
 pub enum NodeAim {
