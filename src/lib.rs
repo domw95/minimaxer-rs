@@ -21,7 +21,7 @@ pub enum SearchExit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SearchResult<M> {
+pub struct SearchResult<M> {
     best: M,
     value: f32,
     exit: SearchExit,

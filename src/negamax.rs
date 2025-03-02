@@ -53,17 +53,17 @@ pub struct Negamax<G, M, E> {
     evaluator: E,
     // Options
     /// Maximum depth to search
-    max_depth: Option<u8>,
+    pub max_depth: Option<u8>,
     /// Maximum time to search
-    max_time: Option<Duration>,
+    pub max_time: Option<Duration>,
     /// Use iterative deepening
-    iterative: bool,
+    pub iterative: bool,
     /// Use alpha-beta pruning
-    alpha_beta: bool,
+    pub alpha_beta: bool,
 }
 
 impl<G, M, E> Negamax<G, M, E> {
-    fn new(node: Node<G, M>, evaluator: E) -> Self {
+    pub fn new(node: Node<G, M>, evaluator: E) -> Self {
         Negamax {
             node,
             evaluator,
@@ -73,10 +73,14 @@ impl<G, M, E> Negamax<G, M, E> {
             alpha_beta: false,
         }
     }
+
+    pub fn replace_gamestate(&mut self, gamestate: G) {
+        self.node = Node::new(gamestate);
+    }
 }
 
 impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
-    fn search(&mut self) -> SearchResult<M> {
+    pub fn search(&mut self) -> SearchResult<M> {
         let start = std::time::Instant::now();
         let aim = NegamaxAim::from(self.node.gamestate.player_aim());
 
@@ -109,7 +113,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     }
 
     /// Play the given move, advancing the tree down a node
-    fn play_move(&mut self, m: &M) {
+    pub fn play_move(&mut self, m: &M) {
         self.node.advance(m);
     }
 }
