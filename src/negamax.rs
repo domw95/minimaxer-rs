@@ -48,7 +48,7 @@ impl Mul<f32> for NegamaxAim {
 }
 
 /// Negamax search with pruning and timeout
-struct Negamax<G, M, E> {
+pub struct Negamax<G, M, E> {
     node: Node<G, M>,
     evaluator: E,
     // Options
