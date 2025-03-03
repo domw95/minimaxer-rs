@@ -42,14 +42,34 @@ impl<G, M> Node<G, M> {
         self.descendants = 0;
         self.terminals = 0;
     }
+
+    pub fn sort_children_descending(&mut self) {
+        self.children.sort_by(|(_, a), (_, b)| {
+            a.value
+                .partial_cmp(&b.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .reverse()
+        });
+    }
+
+    pub fn sort_children_ascending(&mut self) {
+        self.children.sort_by(|(_, a), (_, b)| {
+            a.value
+                .partial_cmp(&b.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 }
 
 impl<G: Gamestate<M>, M: Move> Node<G, M> {
     /// Get the moves for the current player
     /// and store them in the moves field
+    /// Doesnt get them twice
     pub(crate) fn get_moves(&mut self) -> usize {
-        self.moves = self.gamestate.get_moves();
-        self.moves.len()
+        if self.moves.capacity() == 0 {
+            self.moves = self.gamestate.get_moves();
+        }
+        self.moves.len() + self.children.len()
     }
 
     /// Play a move, consuming the node.
@@ -71,5 +91,59 @@ impl<G: Gamestate<M>, M: Move> Node<G, M> {
     /// Evaluate the node and assign to value
     pub(crate) fn evaluate<E: crate::Evaluate<G>>(&mut self, evaluator: &mut E, multiplier: f32) {
         self.value = Some(evaluator.evaluate(&self.gamestate) * multiplier);
+    }
+}
+
+impl<'a, G: Gamestate<M>, M: Move> IntoIterator for &'a mut Node<G, M> {
+    type Item = &'a mut (M, Node<G, M>);
+    type IntoIter = ChildrenIter<'a, G, M>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut_self = unsafe { &mut *(self as *mut Node<G, M>) };
+        let move_iter = self.moves.iter();
+        let child_iter = self.children.iter_mut();
+        ChildrenIter {
+            node: mut_self,
+            move_iter,
+            child_iter,
+        }
+    }
+}
+
+/// Iterator over the children of a node
+/// Generates children from moves if required
+pub struct ChildrenIter<'a, G, M: Move> {
+    node: &'a mut Node<G, M>,
+    move_iter: std::slice::Iter<'a, M>,
+    child_iter: std::slice::IterMut<'a, (M, Node<G, M>)>,
+}
+
+impl<'a, G: Gamestate<M>, M: Move> Iterator for ChildrenIter<'a, G, M> {
+    type Item = &'a mut (M, Node<G, M>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(child) = self.child_iter.next() {
+            Some(child)
+        } else if let Some(m) = self.move_iter.next() {
+            let child = self.node.play_move(m);
+            self.node.children.push((m.clone(), child));
+            unsafe {
+                let last = self.node.children.last_mut().unwrap() as *mut (M, Node<G, M>);
+                Some(&mut *last)
+            }
+        } else {
+            // self.node.moves.clear();
+            None
+        }
+    }
+}
+
+impl<G, M: Move> Drop for ChildrenIter<'_, G, M> {
+    fn drop(&mut self) {
+        self.node.moves.clear();
+
+        for m in self.move_iter.by_ref() {
+            self.node.moves.push(m.clone());
+        }
     }
 }

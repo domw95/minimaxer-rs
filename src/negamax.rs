@@ -5,7 +5,10 @@ use std::{
     u8,
 };
 
-use crate::{node::Node, Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult};
+use crate::{
+    node::{self, Node},
+    Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NegamaxAim {
@@ -60,6 +63,8 @@ pub struct Negamax<G, M, E> {
     pub iterative: bool,
     /// Use alpha-beta pruning
     pub alpha_beta: bool,
+    /// Sort children nodes before searching (when interative deepening)
+    pub pre_sort: bool,
 }
 
 impl<G, M, E> Negamax<G, M, E> {
@@ -71,6 +76,7 @@ impl<G, M, E> Negamax<G, M, E> {
             max_time: None,
             iterative: false,
             alpha_beta: false,
+            pre_sort: false,
         }
     }
 
@@ -140,17 +146,18 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         let mut best = (f32::NEG_INFINITY, None);
         // Assume exhaustive first, any time or depth will override
         let mut exit = SearchExit::Exhaustive;
-        // Go through each move and create a child node
-        for m in node.moves.iter() {
+        // Go through each move and child (iterator creates children on the fly)
+        let mut descendants = 0;
+        let mut terminals = 0;
+        for (m, child) in node.into_iter() {
             // Clone gamestate to make child
-            let mut child = node.play_move(m);
             // Recurse with child node and remember best
-            match negamax(&mut child, evaluator, depth - 1, -aim) {
+            match negamax(child, evaluator, depth - 1, -aim) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
                 SearchExit::Terminal => {
-                    node.terminals += 1;
+                    terminals += 1;
                 }
                 SearchExit::Time => {
                     // cleanup whatever and exit
@@ -164,11 +171,12 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 best = (value, Some(m.clone()));
             }
             // Update parent node details
-            node.descendants += child.descendants + 1;
-            node.terminals += child.terminals;
+            descendants += child.descendants + 1;
+            terminals += child.terminals;
             // Update parent node with child node
-            node.children.push((m.clone(), child));
         }
+        node.descendants = descendants;
+        node.terminals = terminals;
         node.best = Some(best.1.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
@@ -200,17 +208,18 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         let mut best = (f32::NEG_INFINITY, None);
         // Assume exhaustive first, any time or depth will override
         let mut exit = SearchExit::Exhaustive;
-        // Go through each move and create a child node
-        for m in node.moves.iter() {
-            // Clone gamestate to make child
-            let mut child = node.play_move(m);
+
+        let mut descendants = 0;
+        let mut terminals = 0;
+        // Go through each move and child
+        for (m, child) in node.into_iter() {
             // Recurse with child node and remember best
-            match negamax_ab(&mut child, evaluator, depth - 1, -aim, -beta, -alpha) {
+            match negamax_ab(child, evaluator, depth - 1, -aim, -beta, -alpha) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
                 SearchExit::Terminal => {
-                    node.terminals += 1;
+                    terminals += 1;
                 }
                 SearchExit::Time => {
                     // cleanup whatever and exit
@@ -225,10 +234,8 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 best = (value, Some(m.clone()));
             }
             // Update parent node details
-            node.descendants += child.descendants + 1;
-            node.terminals += child.terminals;
-            // Update parent node with child node
-            node.children.push((m.clone(), child));
+            descendants += child.descendants + 1;
+            terminals += child.terminals;
 
             // check a/b
             alpha = alpha.max(value);
@@ -236,6 +243,8 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 break;
             }
         }
+        node.descendants = descendants;
+        node.terminals = terminals;
         node.best = Some(best.1.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
@@ -301,6 +310,8 @@ mod test {
             negamax(&mut node, &mut evaluator, 9, NegamaxAim::Maximise),
             crate::SearchExit::Exhaustive
         );
+        dbg!(node.children.len());
+        dbg!(node.descendants);
         assert_eq!(node.best, Some(TttMove::from(0)));
         assert_eq!(node.terminals, 255168);
     }
@@ -341,6 +352,7 @@ mod test {
 
         let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator);
         n.alpha_beta = true;
+        // n.max_depth = Some(3);
         let result = n.search();
         println!("{:?}", result);
         n.play_move(&result.best);
