@@ -46,11 +46,7 @@ impl Mul<f32> for NegamaxAim {
     }
 }
 
-/// Negamax search with pruning and timeout
-pub struct Negamax<G, M, E> {
-    node: Node<G, M>,
-    evaluator: E,
-    // Options
+pub struct SearchOptions {
     /// Maximum depth to search
     pub max_depth: Option<u8>,
     /// Maximum time to search
@@ -63,16 +59,26 @@ pub struct Negamax<G, M, E> {
     pub pre_sort: bool,
 }
 
+/// Negamax search with pruning and timeout
+pub struct Negamax<G, M, E> {
+    node: Node<G, M>,
+    evaluator: E,
+    /// Options
+    pub options: SearchOptions,
+}
+
 impl<G, M, E> Negamax<G, M, E> {
     pub fn new(node: Node<G, M>, evaluator: E) -> Self {
         Negamax {
             node,
             evaluator,
-            max_depth: None,
-            max_time: None,
-            iterative: false,
-            alpha_beta: false,
-            pre_sort: false,
+            options: SearchOptions {
+                max_depth: None,
+                max_time: None,
+                iterative: false,
+                alpha_beta: false,
+                pre_sort: false,
+            },
         }
     }
 
@@ -86,16 +92,17 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         let start = std::time::Instant::now();
         let aim = NegamaxAim::from(self.node.gamestate.player_aim());
         let expiration = self
+            .options
             .max_time
             .map(|duration| std::time::Instant::now() + duration);
 
         // Check if iterative enabled
-        if self.iterative {
+        if self.options.iterative {
             // Implement iterative deepening
             let mut depth = 1;
             let mut result = None;
             loop {
-                match match self.alpha_beta {
+                match match self.options.alpha_beta {
                     true => negamax_ab(
                         &mut self.node,
                         &mut self.evaluator,
@@ -147,11 +154,11 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             }
         }
 
-        let exit = match self.alpha_beta {
+        let exit = match self.options.alpha_beta {
             true => negamax_ab(
                 &mut self.node,
                 &mut self.evaluator,
-                self.max_depth.unwrap_or(u8::MAX),
+                self.options.max_depth.unwrap_or(u8::MAX),
                 expiration,
                 aim,
                 f32::NEG_INFINITY,
@@ -160,7 +167,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             false => negamax(
                 &mut self.node,
                 &mut self.evaluator,
-                self.max_depth.unwrap_or(u8::MAX),
+                self.options.max_depth.unwrap_or(u8::MAX),
                 aim,
             ),
         };
@@ -417,8 +424,8 @@ mod test {
         // assert_eq!(node.terminals, 255168);
 
         let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator);
-        n.alpha_beta = true;
-        // n.max_depth = Some(3);
+        n.options.alpha_beta = true;
+        // n.options.max_depth = Some(3);
         let result = n.search();
         println!("{:?}", result);
         n.play_move(&result.best);
