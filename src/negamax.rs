@@ -100,7 +100,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                         &mut self.node,
                         &mut self.evaluator,
                         depth,
-                        expiration,
+                        if depth > 1 { expiration } else { None },
                         aim,
                         f32::NEG_INFINITY,
                         f32::INFINITY,
