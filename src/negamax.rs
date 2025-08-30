@@ -1,14 +1,9 @@
 use std::{
-    mem,
     ops::{Mul, Neg},
     time::Duration,
-    u8,
 };
 
-use crate::{
-    node::{self, Node},
-    Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult,
-};
+use crate::{node::Node, Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NegamaxAim {
@@ -89,12 +84,16 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     pub fn search(&mut self) -> SearchResult<M> {
         let start = std::time::Instant::now();
         let aim = NegamaxAim::from(self.node.gamestate.player_aim());
+        let expiration = self
+            .max_time
+            .map(|duration| std::time::Instant::now() + duration);
 
         let exit = match self.alpha_beta {
             true => negamax_ab(
                 &mut self.node,
                 &mut self.evaluator,
                 self.max_depth.unwrap_or(u8::MAX),
+                expiration,
                 aim,
                 f32::NEG_INFINITY,
                 f32::INFINITY,
@@ -189,6 +188,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     node: &mut Node<G, M>,
     evaluator: &mut E,
     depth: u8,
+    expiration: Option<std::time::Instant>,
     aim: NegamaxAim,
     mut alpha: f32,
     beta: f32,
@@ -202,6 +202,12 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         node.evaluate(evaluator, aim.into());
         SearchExit::Depth
     } else {
+        // Check expiration
+        if let Some(expire) = expiration {
+            if expire < std::time::Instant::now() {
+                return SearchExit::Time;
+            }
+        }
         // continue recursion
         node.reset_stats();
         // track best value and move
@@ -214,7 +220,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // Go through each move and child
         for (m, child) in node.into_iter() {
             // Recurse with child node and remember best
-            match negamax_ab(child, evaluator, depth - 1, -aim, -beta, -alpha) {
+            match negamax_ab(child, evaluator, depth - 1, expiration, -aim, -beta, -alpha) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
@@ -341,6 +347,7 @@ mod test {
                 &mut node,
                 &mut evaluator,
                 9,
+                None,
                 NegamaxAim::Maximise,
                 f32::NEG_INFINITY,
                 f32::INFINITY

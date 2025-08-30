@@ -13,3 +13,6 @@ harness = false
 
 [profile.bench]
 debug = true
+
+[dependencies]
+burn = "0.18.0"
