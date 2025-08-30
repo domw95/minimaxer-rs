@@ -58,6 +58,8 @@ pub struct SearchOptions {
     pub alpha_beta: bool,
     /// Sort children nodes before searching (when interative deepening)
     pub pre_sort: bool,
+    /// Run the search in parallel
+    pub parallel: bool,
 }
 
 /// Negamax search with pruning and timeout
@@ -97,17 +99,30 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             let mut depth = 1;
             let mut result = None;
             loop {
-                match match self.options.alpha_beta {
-                    true => negamax_ab(
-                        &mut self.node,
-                        &mut self.evaluator,
-                        depth,
-                        if depth > 1 { expiration } else { None },
-                        aim,
-                        f32::NEG_INFINITY,
-                        f32::INFINITY,
-                    ),
-                    false => negamax(&mut self.node, &mut self.evaluator, depth, aim),
+                match if self.options.alpha_beta {
+                    if self.options.parallel {
+                        negamax_ab_parallel(
+                            &mut self.node,
+                            &mut self.evaluator,
+                            depth,
+                            if depth > 1 { expiration } else { None },
+                            aim,
+                            f32::NEG_INFINITY,
+                            f32::INFINITY,
+                        )
+                    } else {
+                        negamax_ab(
+                            &mut self.node,
+                            &mut self.evaluator,
+                            depth,
+                            if depth > 1 { expiration } else { None },
+                            aim,
+                            f32::NEG_INFINITY,
+                            f32::INFINITY,
+                        )
+                    }
+                } else {
+                    negamax(&mut self.node, &mut self.evaluator, depth, aim)
                 } {
                     SearchExit::Depth => {
                         // Store result and carry on to next depth
@@ -181,6 +196,81 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     /// Play the given move, advancing the tree down a node
     pub fn play_move(&mut self, m: &M) {
         self.node.advance(m);
+    }
+}
+
+fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
+    node: &mut Node<G, M>,
+    evaluator: &mut E,
+    depth: u8,
+    expiration: Option<std::time::Instant>,
+    aim: NegamaxAim,
+    mut alpha: f32,
+    beta: f32,
+) -> SearchExit {
+    // Run the negamax search in parallel at this depth
+    if node.get_moves() == 0 {
+        // Game end condition, evaluate the gamestate
+        node.evaluate(evaluator, aim.into());
+        SearchExit::Terminal
+    } else if depth == 0 {
+        // end of recursion, evaluate the gamestate
+        node.evaluate(evaluator, aim.into());
+        SearchExit::Depth
+    } else {
+        // Check expiration
+        if let Some(expire) = expiration {
+            if expire < std::time::Instant::now() {
+                return SearchExit::Time;
+            }
+        }
+        // continue recursion
+        node.reset_stats();
+        // track best value and move
+        let mut best = (f32::NEG_INFINITY, None);
+        // Assume exhaustive first, any time or depth will override
+        let mut exit = SearchExit::Exhaustive;
+
+        let mut descendants = 0;
+        let mut terminals = 0;
+        // Go through each move and child
+        for (m, child) in node.into_iter() {
+            // Recurse with child node and remember best
+            match negamax_ab(child, evaluator, depth - 1, expiration, -aim, -beta, -alpha) {
+                SearchExit::Depth => {
+                    exit = SearchExit::Depth;
+                }
+                SearchExit::Terminal => {
+                    terminals += 1;
+                }
+                SearchExit::Time => {
+                    // cleanup whatever and exit
+                    return SearchExit::Time;
+                }
+                SearchExit::Exhaustive => {}
+            };
+
+            // Get best out of current and child
+            let value = -child.value.unwrap();
+            if value > best.0 {
+                best = (value, Some(m.clone()));
+            }
+            // Update parent node details
+            descendants += child.descendants + 1;
+            terminals += child.terminals;
+
+            // check a/b
+            alpha = alpha.max(value);
+            if alpha >= beta {
+                break;
+            }
+        }
+        node.descendants = descendants;
+        node.terminals = terminals;
+        node.best = Some(best.1.unwrap());
+        node.value = Some(best.0);
+        node.search_depth = depth;
+        exit
     }
 }
 

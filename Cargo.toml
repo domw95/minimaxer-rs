@@ -16,3 +16,4 @@ debug = true
 
 [dependencies]
 burn = "0.18.0"
+rayon = "1.11.0"
