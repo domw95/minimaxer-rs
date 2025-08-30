@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     ops::{Mul, Neg},
     time::Duration,
@@ -87,6 +88,64 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         let expiration = self
             .max_time
             .map(|duration| std::time::Instant::now() + duration);
+
+        // Check if iterative enabled
+        if self.iterative {
+            // Implement iterative deepening
+            let mut depth = 1;
+            let mut result = None;
+            loop {
+                match match self.alpha_beta {
+                    true => negamax_ab(
+                        &mut self.node,
+                        &mut self.evaluator,
+                        depth,
+                        expiration,
+                        aim,
+                        f32::NEG_INFINITY,
+                        f32::INFINITY,
+                    ),
+                    false => negamax(&mut self.node, &mut self.evaluator, depth, aim),
+                } {
+                    SearchExit::Depth => {
+                        // Store result and carry on to next depth
+                        result = Some(SearchResult {
+                            best: self.node.best.clone().unwrap(),
+                            value: self.node.value.unwrap(),
+                            exit: SearchExit::Depth,
+                            nodes: self.node.descendants,
+                            terminals: self.node.terminals,
+                            time: start.elapsed(),
+                            depth: self.node.search_depth,
+                        });
+                        depth += 1;
+                    }
+                    SearchExit::Time => {
+                        // This depth failed, return previous depth result
+                        let mut result = result.unwrap();
+                        result.exit = SearchExit::Time;
+                        result.time = start.elapsed();
+                        return result;
+                    }
+                    SearchExit::Exhaustive => {
+                        // Full search complete, return result
+                        return SearchResult {
+                            best: self.node.best.clone().unwrap(),
+                            value: self.node.value.unwrap(),
+                            exit: SearchExit::Exhaustive,
+                            nodes: self.node.descendants,
+                            terminals: self.node.terminals,
+                            time: start.elapsed(),
+                            depth: self.node.search_depth,
+                        };
+                    }
+                    SearchExit::Terminal => {
+                        // No moves available, return error
+                        panic!("No moves available");
+                    }
+                }
+            }
+        }
 
         let exit = match self.alpha_beta {
             true => negamax_ab(
