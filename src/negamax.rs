@@ -46,6 +46,7 @@ impl Mul<f32> for NegamaxAim {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchOptions {
     /// Maximum depth to search
     pub max_depth: Option<u8>,
