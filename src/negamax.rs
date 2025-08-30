@@ -46,7 +46,7 @@ impl Mul<f32> for NegamaxAim {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct SearchOptions {
     /// Maximum depth to search
     pub max_depth: Option<u8>,
@@ -69,17 +69,11 @@ pub struct Negamax<G, M, E> {
 }
 
 impl<G, M, E> Negamax<G, M, E> {
-    pub fn new(node: Node<G, M>, evaluator: E) -> Self {
+    pub fn new(node: Node<G, M>, evaluator: E, options: SearchOptions) -> Self {
         Negamax {
             node,
             evaluator,
-            options: SearchOptions {
-                max_depth: None,
-                max_time: None,
-                iterative: false,
-                alpha_beta: false,
-                pre_sort: false,
-            },
+            options,
         }
     }
 
@@ -332,7 +326,7 @@ mod test {
     use super::{negamax, Negamax};
     use crate::{
         games::tictactoe::{Ttt, TttEvaluator, TttMove},
-        negamax::{negamax_ab, NegamaxAim},
+        negamax::{negamax_ab, NegamaxAim, SearchOptions},
         node::Node,
     };
 
@@ -391,7 +385,8 @@ mod test {
 
     #[test]
     fn ttt_advance() {
-        let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator);
+        let opts = SearchOptions::default();
+        let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, opts);
 
         for _ in 0..9 {
             let result = n.search();
@@ -424,7 +419,7 @@ mod test {
         assert_eq!(node.best, Some(TttMove::from(0)));
         // assert_eq!(node.terminals, 255168);
 
-        let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator);
+        let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, Default::default());
         n.options.alpha_beta = true;
         // n.options.max_depth = Some(3);
         let result = n.search();
