@@ -1,6 +1,10 @@
+use atomic_float::{AtomicF32, AtomicF64};
 use core::panic;
+use log::{debug, trace};
+use rayon::prelude::*;
 use std::{
     ops::{Mul, Neg},
+    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -101,6 +105,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             loop {
                 match if self.options.alpha_beta {
                     if self.options.parallel {
+                        debug!("Running parallel negamax with depth {depth}");
                         negamax_ab_parallel(
                             &mut self.node,
                             &mut self.evaluator,
@@ -111,6 +116,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             f32::INFINITY,
                         )
                     } else {
+                        debug!("Running single threaded negamax with depth {depth}");
                         negamax_ab(
                             &mut self.node,
                             &mut self.evaluator,
@@ -164,22 +170,37 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             }
         }
 
-        let exit = match self.options.alpha_beta {
-            true => negamax_ab(
+        let exit = if self.options.alpha_beta {
+            if self.options.parallel {
+                debug!("Running parallel negamax");
+                negamax_ab_parallel(
+                    &mut self.node,
+                    &mut self.evaluator,
+                    self.options.max_depth.unwrap_or(u8::MAX),
+                    expiration,
+                    aim,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                )
+            } else {
+                debug!("Running single threaded negamax");
+                negamax_ab(
+                    &mut self.node,
+                    &mut self.evaluator,
+                    self.options.max_depth.unwrap_or(u8::MAX),
+                    expiration,
+                    aim,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                )
+            }
+        } else {
+            negamax(
                 &mut self.node,
                 &mut self.evaluator,
                 self.options.max_depth.unwrap_or(u8::MAX),
-                expiration,
                 aim,
-                f32::NEG_INFINITY,
-                f32::INFINITY,
-            ),
-            false => negamax(
-                &mut self.node,
-                &mut self.evaluator,
-                self.options.max_depth.unwrap_or(u8::MAX),
-                aim,
-            ),
+            )
         };
 
         SearchResult {
@@ -199,13 +220,22 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParallelResult<M> {
+    exit: SearchExit,
+    best: f32,
+    mov: M,
+    descendants: u32,
+    terminals: u32,
+}
+
 fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     node: &mut Node<G, M>,
     evaluator: &mut E,
     depth: u8,
     expiration: Option<std::time::Instant>,
     aim: NegamaxAim,
-    mut alpha: f32,
+    alpha: f32,
     beta: f32,
 ) -> SearchExit {
     // Run the negamax search in parallel at this depth
@@ -226,50 +256,78 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         }
         // continue recursion
         node.reset_stats();
-        // track best value and move
+        // Go through each move and child in parallel using rayon
+        // Print node move state
+        node.create_all_children();
+
+        let alpha = AtomicF32::new(alpha);
+        let mut results = Vec::new();
+        let evaluators = node
+            .children
+            .iter_mut()
+            .map(|child| evaluator.clone())
+            .collect::<Vec<_>>();
+        node.children
+            .par_iter_mut()
+            .zip(evaluators)
+            .map(|((m, child), mut evaluator)| {
+                // Recurse with child node and remember best
+                let exit = negamax_ab(
+                    child,
+                    &mut evaluator,
+                    depth - 1,
+                    expiration,
+                    -aim,
+                    -beta,
+                    -alpha.load(Ordering::Relaxed),
+                );
+
+                // Get best out of current and child
+                let value = -child.value.unwrap();
+
+                // Store larger of alpha and value in alpha
+                let a = alpha.load(Ordering::Acquire);
+                alpha.store(a.max(value), Ordering::Release);
+
+                // Return result
+                let result = ParallelResult {
+                    exit,
+                    best: value,
+                    mov: m.clone(),
+                    descendants: child.descendants + 1,
+                    terminals: child.terminals + 1,
+                };
+                debug!("Result: {:?}", result);
+                result
+            })
+            .collect_into_vec(&mut results);
+
+        // Update node stats
         let mut best = (f32::NEG_INFINITY, None);
-        // Assume exhaustive first, any time or depth will override
-        let mut exit = SearchExit::Exhaustive;
-
-        let mut descendants = 0;
-        let mut terminals = 0;
-        // Go through each move and child
-        for (m, child) in node.into_iter() {
-            // Recurse with child node and remember best
-            match negamax_ab(child, evaluator, depth - 1, expiration, -aim, -beta, -alpha) {
-                SearchExit::Depth => {
-                    exit = SearchExit::Depth;
-                }
-                SearchExit::Terminal => {
-                    terminals += 1;
-                }
-                SearchExit::Time => {
-                    // cleanup whatever and exit
-                    return SearchExit::Time;
-                }
-                SearchExit::Exhaustive => {}
-            };
-
-            // Get best out of current and child
-            let value = -child.value.unwrap();
-            if value > best.0 {
-                best = (value, Some(m.clone()));
-            }
-            // Update parent node details
-            descendants += child.descendants + 1;
-            terminals += child.terminals;
-
-            // check a/b
-            alpha = alpha.max(value);
-            if alpha >= beta {
-                break;
+        for r in &results {
+            node.descendants += r.descendants;
+            node.terminals += r.terminals;
+            if r.best > best.0 {
+                best = (r.best, Some(r.mov.clone()));
             }
         }
-        node.descendants = descendants;
-        node.terminals = terminals;
         node.best = Some(best.1.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
+        // Return exit reason
+        let mut exit = SearchExit::Exhaustive;
+        for r in results {
+            match r.exit {
+                SearchExit::Depth => {
+                    exit = SearchExit::Depth;
+                }
+                SearchExit::Terminal => {}
+                SearchExit::Time => {
+                    return SearchExit::Time;
+                }
+                SearchExit::Exhaustive => {}
+            }
+        }
         exit
     }
 }
@@ -370,6 +428,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         let mut terminals = 0;
         // Go through each move and child
         for (m, child) in node.into_iter() {
+            trace!("Exploring move {m:?} at depth {depth}");
             // Recurse with child node and remember best
             match negamax_ab(child, evaluator, depth - 1, expiration, -aim, -beta, -alpha) {
                 SearchExit::Depth => {
@@ -419,6 +478,8 @@ mod test {
         negamax::{negamax_ab, NegamaxAim, SearchOptions},
         node::Node,
     };
+
+    use test_log::test;
 
     #[test]
     fn negamax_ttt() {
@@ -518,5 +579,40 @@ mod test {
         let result = n.search();
         println!("{:?}", result);
         assert_eq!(result.best, TttMove::from(4));
+    }
+
+    #[test]
+    fn ttt_parallel() {
+        // Make sure that parallel and single threaded deliver the same results for each depth
+        let mut ttt = Ttt::new(crate::games::tictactoe::Player::One);
+        for depth in 1..10 {
+            let mut par = Negamax::new(
+                Node::new(ttt.clone()),
+                TttEvaluator,
+                SearchOptions {
+                    alpha_beta: true,
+                    parallel: true,
+                    max_depth: Some(depth),
+                    ..Default::default()
+                },
+            );
+
+            let mut single = Negamax::new(
+                Node::new(ttt.clone()),
+                TttEvaluator,
+                SearchOptions {
+                    alpha_beta: true,
+                    parallel: false,
+                    max_depth: Some(depth),
+                    ..Default::default()
+                },
+            );
+
+            let par_result = par.search();
+            let single_result = single.search();
+            println!("Par: {:?}, Single: {:?}", par_result, single_result);
+            // assert_eq!(par_result.best, single_result.best);
+            assert_eq!(par_result.value, single_result.value);
+        }
     }
 }

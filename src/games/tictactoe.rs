@@ -140,7 +140,7 @@ impl Gamestate<TttMove> for Ttt {
         }
     }
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TttEvaluator;
 
 impl Evaluate<Ttt> for TttEvaluator {

@@ -92,6 +92,14 @@ impl<G: Gamestate<M>, M: Move> Node<G, M> {
     pub(crate) fn evaluate<E: crate::Evaluate<G>>(&mut self, evaluator: &mut E, multiplier: f32) {
         self.value = Some(evaluator.evaluate(&self.gamestate) * multiplier);
     }
+
+    pub fn create_all_children(&mut self) {
+        while let Some(m) = self.moves.pop() {
+            let mut gs = self.gamestate.clone();
+            gs.play_move(&m);
+            self.children.push((m, Node::new(gs)));
+        }
+    }
 }
 
 impl<'a, G: Gamestate<M>, M: Move> IntoIterator for &'a mut Node<G, M> {
@@ -100,12 +108,10 @@ impl<'a, G: Gamestate<M>, M: Move> IntoIterator for &'a mut Node<G, M> {
 
     fn into_iter(self) -> Self::IntoIter {
         let mut_self = unsafe { &mut *(self as *mut Node<G, M>) };
-        let move_iter = self.moves.iter();
-        let child_iter = self.children.iter_mut();
+
         ChildrenIter {
             node: mut_self,
-            move_iter,
-            child_iter,
+            child_pos: 0,
         }
     }
 }
@@ -114,36 +120,29 @@ impl<'a, G: Gamestate<M>, M: Move> IntoIterator for &'a mut Node<G, M> {
 /// Generates children from moves if required
 pub struct ChildrenIter<'a, G, M: Move> {
     node: &'a mut Node<G, M>,
-    move_iter: std::slice::Iter<'a, M>,
-    child_iter: std::slice::IterMut<'a, (M, Node<G, M>)>,
+    child_pos: usize,
 }
 
 impl<'a, G: Gamestate<M>, M: Move> Iterator for ChildrenIter<'a, G, M> {
     type Item = &'a mut (M, Node<G, M>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(child) = self.child_iter.next() {
+        if self.child_pos < self.node.children.len() {
+            // Get a mut ref to child at child_pos
+            let child =
+                unsafe { &mut *(&mut self.node.children[self.child_pos] as *mut (M, Node<G, M>)) };
+            self.child_pos += 1;
             Some(child)
-        } else if let Some(m) = self.move_iter.next() {
-            let child = self.node.play_move(m);
-            self.node.children.push((m.clone(), child));
+        } else if let Some(m) = self.node.moves.pop() {
+            let child = self.node.play_move(&m);
+            self.node.children.push((m, child));
+            self.child_pos += 1;
             unsafe {
                 let last = self.node.children.last_mut().unwrap() as *mut (M, Node<G, M>);
                 Some(&mut *last)
             }
         } else {
-            // self.node.moves.clear();
             None
-        }
-    }
-}
-
-impl<G, M: Move> Drop for ChildrenIter<'_, G, M> {
-    fn drop(&mut self) {
-        self.node.moves.clear();
-
-        for m in self.move_iter.by_ref() {
-            self.node.moves.push(m.clone());
         }
     }
 }

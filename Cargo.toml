@@ -15,5 +15,8 @@ harness = false
 debug = true
 
 [dependencies]
+atomic_float = "1.1.0"
 burn = "0.18.0"
+log = "0.4.27"
 rayon = "1.11.0"
+test-log = "0.2.18"

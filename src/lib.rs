@@ -32,9 +32,9 @@ pub enum NodeAim {
     Maximise,
 }
 
-pub trait Move: Clone + PartialEq {}
+pub trait Move: Clone + PartialEq + Send + Sync + Debug {}
 
-pub trait Gamestate<M>: Clone {
+pub trait Gamestate<M>: Clone + Send + Sync {
     /// Get the moves for the current player
     fn get_moves(&mut self) -> Vec<M>;
     /// Make a move
@@ -43,7 +43,7 @@ pub trait Gamestate<M>: Clone {
     fn player_aim(&self) -> NodeAim;
 }
 
-pub trait Evaluate<G> {
+pub trait Evaluate<G>: Clone + Send + Sync {
     /// Evaluate the gamestate from perspective of first player
     fn evaluate(&mut self, g: &G) -> f32;
 }
