@@ -7,7 +7,7 @@ edition = "2021"
 criterion = "0.5"
 
 [[bench]]
-name = "my_benchmark"
+name = "search"
 harness = false
 
 
