@@ -64,6 +64,20 @@ pub struct SearchOptions {
     pub pre_sort: bool,
     /// Run the search in parallel
     pub parallel: bool,
+    /// Prefer short winning lines and long losing ones.
+    /// Weakens the alpha == beta cutoff, so it costs some nodes.
+    pub prune_by_path_length: bool,
+    /// Pick uniformly at random between root moves that tie on depth and
+    /// value. Also weakens the alpha == beta cutoff.
+    pub random_best: bool,
+    /// Pick randomly between root moves, weighted towards better values.
+    /// `w` makes each +1 of value `w` times more likely. 0 disables.
+    pub random_weight: f32,
+    /// Stop cutting off on `alpha == beta`, so equal-valued siblings survive
+    /// to be chosen between. Required for `prune_by_path_length` to see
+    /// alternatives, and widens `random_best`. Costs a lot of nodes when the
+    /// evaluator produces many equal values.
+    pub keep_equal_siblings: bool,
 }
 
 /// Negamax search with pruning and timeout
@@ -89,6 +103,17 @@ impl<G, M, E> Negamax<G, M, E> {
 }
 
 impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
+    /// The move to report from the root, honouring the random selection
+    /// options. Falls back to the search's own choice.
+    fn root_move(&self, aim: NegamaxAim) -> M {
+        if self.options.random_best || self.options.random_weight > 0.0 {
+            if let Some(m) = pick_root_move(&self.node, aim, &self.options) {
+                return m;
+            }
+        }
+        self.node.best.clone().unwrap()
+    }
+
     pub fn search(&mut self) -> SearchResult<M> {
         let start = std::time::Instant::now();
         let aim = NegamaxAim::from(self.node.gamestate.player_aim());
@@ -114,7 +139,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
-                            self.options.pre_sort,
+                            self.options,
                         )
                     } else {
                         debug!("Running single threaded negamax with depth {depth}");
@@ -126,7 +151,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
-                            self.options.pre_sort,
+                            self.options,
                         )
                     }
                 } else {
@@ -135,7 +160,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     SearchExit::Depth => {
                         // Store result and carry on to next depth
                         result = Some(SearchResult {
-                            best: self.node.best.clone().unwrap(),
+                            best: self.root_move(aim),
                             value: self.node.value.unwrap(),
                             exit: SearchExit::Depth,
                             nodes: self.node.descendants,
@@ -160,7 +185,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     SearchExit::Exhaustive => {
                         // Full search complete, return result
                         return SearchResult {
-                            best: self.node.best.clone().unwrap(),
+                            best: self.root_move(aim),
                             value: self.node.value.unwrap(),
                             exit: SearchExit::Exhaustive,
                             nodes: self.node.descendants,
@@ -188,7 +213,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     aim,
                     f32::NEG_INFINITY,
                     f32::INFINITY,
-                    self.options.pre_sort,
+                    self.options,
                 )
             } else {
                 debug!("Running single threaded negamax");
@@ -200,7 +225,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     aim,
                     f32::NEG_INFINITY,
                     f32::INFINITY,
-                    self.options.pre_sort,
+                    self.options,
                 )
             }
         } else {
@@ -213,7 +238,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         };
 
         SearchResult {
-            best: self.node.best.clone().unwrap(),
+            best: self.root_move(aim),
             value: self.node.value.unwrap(),
             exit,
             nodes: self.node.descendants,
@@ -246,7 +271,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     aim: NegamaxAim,
     alpha: f32,
     beta: f32,
-    pre_sort: bool,
+    opts: SearchOptions,
 ) -> SearchExit {
     // Run the negamax search in parallel at this depth
     if depth == 0 {
@@ -255,13 +280,16 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // the search when the move generator allocates.
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
+            node.path_length = 0;
             SearchExit::Terminal
         } else {
+            node.path_length = 1;
             SearchExit::Depth
         }
     } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
+        node.path_length = 0;
         SearchExit::Terminal
     } else {
         // Check expiration
@@ -304,7 +332,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     c_aim,
                     c_alpha,
                     c_beta,
-                    pre_sort,
+                    opts,
                 );
 
                 // Get best out of current and child
@@ -376,6 +404,107 @@ fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: Negamax
     }
 }
 
+/// Re-pick the root move among equally good alternatives.
+///
+/// The search keeps the first move that beats the incumbent, so a
+/// deterministic engine replays the same game forever. That is poor value as
+/// a training opponent, hence the option to spread the choice over moves the
+/// search cannot separate.
+fn pick_root_move<G: Gamestate<M>, M: Move>(
+    node: &Node<G, M>,
+    aim: NegamaxAim,
+    opts: &SearchOptions,
+) -> Option<M> {
+    use rand::Rng;
+    if node.children.is_empty() {
+        return None;
+    }
+    let best_value = node.value?;
+    // Depth of the child the search actually settled on. Children left behind
+    // by a cutoff have a staler search_depth and are not real alternatives.
+    let best_depth = node
+        .children
+        .iter()
+        .find(|(m, _)| Some(m) == node.best.as_ref())
+        .map(|(_, c)| c.search_depth)?;
+
+    let mut rng = rand::thread_rng();
+
+    if opts.random_best {
+        let tied: Vec<&M> = node
+            .children
+            .iter()
+            .filter(|(_, c)| c.search_depth == best_depth && parent_view(c, aim) == best_value)
+            .map(|(m, _)| m)
+            .collect();
+        if tied.is_empty() {
+            return None;
+        }
+        return Some(tied[rng.gen_range(0..tied.len())].clone());
+    }
+
+    if opts.random_weight > 0.0 {
+        // weight^(value - best) so each +1 of value is `weight` times likelier.
+        let mut total = 0.0f32;
+        let weighted: Vec<(&M, f32)> = node
+            .children
+            .iter()
+            .filter(|(_, c)| c.search_depth == best_depth)
+            .map(|(m, c)| {
+                let w = opts
+                    .random_weight
+                    .powf(parent_view(c, aim) - best_value)
+                    .clamp(f32::MIN_POSITIVE, f32::MAX);
+                total += w;
+                (m, w)
+            })
+            .collect();
+        if weighted.is_empty() || !total.is_finite() || total <= 0.0 {
+            return None;
+        }
+        let mut pick = rng.gen_range(0.0..total);
+        for (m, w) in weighted {
+            pick -= w;
+            if pick <= 0.0 {
+                return Some(m.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Order children best-first for the player to move at `aim`.
+///
+/// Primary key is how deeply the child was actually searched: a child left
+/// with a stale value by a beta cutoff should not displace one with a fresh
+/// result. Value breaks that tie, and path length breaks the value tie when
+/// `prune_by_path_length` is on.
+fn order_children<G: Gamestate<M>, M: Move>(
+    node: &mut Node<G, M>,
+    aim: NegamaxAim,
+    prune_by_path_length: bool,
+) {
+    node.children.sort_by(|(_, a), (_, b)| {
+        b.search_depth
+            .cmp(&a.search_depth)
+            .then_with(|| {
+                parent_view(b, aim)
+                    .partial_cmp(&parent_view(a, aim))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                if !prune_by_path_length {
+                    return std::cmp::Ordering::Equal;
+                }
+                if parent_view(a, aim) > 0.0 {
+                    a.path_length.cmp(&b.path_length)
+                } else {
+                    b.path_length.cmp(&a.path_length)
+                }
+            })
+    });
+}
+
 /// Negamax search, no pruning or timeout
 pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     node: &mut Node<G, M>,
@@ -389,13 +518,16 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // the search when the move generator allocates.
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
+            node.path_length = 0;
             SearchExit::Terminal
         } else {
+            node.path_length = 1;
             SearchExit::Depth
         }
     } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
+        node.path_length = 0;
         SearchExit::Terminal
     } else {
         // continue recursion
@@ -452,7 +584,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     aim: NegamaxAim,
     mut alpha: f32,
     beta: f32,
-    pre_sort: bool,
+    opts: SearchOptions,
 ) -> SearchExit {
     if depth == 0 {
         // End of recursion. Checked before move generation: leaves are the bulk
@@ -460,13 +592,16 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // the search when the move generator allocates.
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
+            node.path_length = 0;
             SearchExit::Terminal
         } else {
+            node.path_length = 1;
             SearchExit::Depth
         }
     } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
+        node.path_length = 0;
         SearchExit::Terminal
     } else {
         // Check expiration
@@ -481,15 +616,12 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // A child stores its value from its own perspective and the parent
         // negates it, so ascending child value puts this node's best move
         // first, which is what makes alpha-beta cut off early.
-        if pre_sort && !node.children.is_empty() {
-            node.children.sort_by(|(_, a), (_, b)| {
-                parent_view(b, aim)
-                    .partial_cmp(&parent_view(a, aim))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+        if opts.pre_sort && !node.children.is_empty() {
+            order_children(node, aim, opts.prune_by_path_length);
         }
         // track best value and move
         let mut best = (f32::NEG_INFINITY, None);
+        let mut best_path: u8 = 0;
         // Assume exhaustive first, any time or depth will override
         let mut exit = SearchExit::Exhaustive;
 
@@ -514,7 +646,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 c_aim,
                 c_alpha,
                 c_beta,
-                pre_sort,
+                opts,
             ) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
@@ -533,6 +665,18 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             let value = parent_view(child, aim);
             if value > best.0 {
                 best = (value, Some(m.clone()));
+                best_path = child.path_length;
+            } else if opts.prune_by_path_length && value == best.0 && best.1.is_some() {
+                // Same value: take the quicker win, or the slower loss.
+                let better = if best.0 > 0.0 {
+                    child.path_length < best_path
+                } else {
+                    child.path_length > best_path
+                };
+                if better {
+                    best = (value, Some(m.clone()));
+                    best_path = child.path_length;
+                }
             }
             // Update parent node details
             descendants += child.descendants + 1;
@@ -540,7 +684,13 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
 
             // check a/b
             alpha = alpha.max(value);
-            if alpha >= beta {
+            if alpha > beta {
+                break;
+            } else if alpha >= beta && !opts.keep_equal_siblings {
+                // Cutting on equality hides equal-valued siblings. Keeping them
+                // is what path-length preference needs, and it widens the pool
+                // random_best can draw from -- but it is expensive, so it is
+                // opt-in rather than implied.
                 break;
             }
         }
@@ -549,6 +699,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         node.best = Some(best.1.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
+        node.path_length = best_path.saturating_add(1);
         exit
     }
 }
@@ -657,7 +808,7 @@ mod test {
                 NegamaxAim::Maximise,
                 f32::NEG_INFINITY,
                 f32::INFINITY,
-                false
+                SearchOptions::default()
             ),
             crate::SearchExit::Exhaustive
         );

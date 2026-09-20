@@ -22,6 +22,9 @@ pub struct Node<G, M> {
     pub(crate) terminals: u32,
     // Depth searched to from this node
     pub(crate) search_depth: u8,
+    // Plies from this node to the nearest leaf along the best line.
+    // 0 at a terminal, 1 at a depth-limited node.
+    pub(crate) path_length: u8,
 }
 
 impl<G, M> Node<G, M> {
@@ -35,6 +38,7 @@ impl<G, M> Node<G, M> {
             descendants: 0,
             terminals: 0,
             search_depth: 0,
+            path_length: 0,
         }
     }
 

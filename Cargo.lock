@@ -3265,6 +3265,7 @@ dependencies = [
  "burn",
  "criterion",
  "log",
+ "rand 0.8.5",
  "rayon",
  "test-log",
 ]
