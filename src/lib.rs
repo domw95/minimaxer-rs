@@ -1,6 +1,7 @@
 use std::{fmt::Debug, time::Duration};
 pub mod games;
 pub mod negamax;
+pub mod tt;
 pub mod node;
 
 /// Reason for finishing search
@@ -41,6 +42,16 @@ pub trait Gamestate<M>: Clone + Send + Sync {
     fn play_move(&mut self, m: &M);
     /// Get the aim of the current player
     fn player_aim(&self) -> NodeAim;
+    /// A key identifying this position for the transposition table.
+    ///
+    /// Must cover everything that affects the value of the position,
+    /// including whose turn it is, and must ignore anything that does not
+    /// (a random number generator that the search never advances, say).
+    /// Returning 0 disables the table for this game, which is the default.
+    fn position_key(&self) -> u64 {
+        0
+    }
+
     /// Cheap check for whether the game has ended here.
     ///
     /// Called at every leaf, which is the bulk of the search tree. The default

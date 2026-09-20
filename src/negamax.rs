@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::tt::{Probe, Tt};
 use crate::{node::Node, Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +74,10 @@ pub struct SearchOptions {
     /// Pick randomly between root moves, weighted towards better values.
     /// `w` makes each +1 of value `w` times more likely. 0 disables.
     pub random_weight: f32,
+    /// Size of the transposition table, as bits of index: `2^bits` entries.
+    /// 0 disables it, which is the default. Needs `Gamestate::position_key`
+    /// to return something other than 0 to be of any use.
+    pub tt_bits: u8,
     /// Order children by their own static evaluation the first time a node is
     /// expanded.
     ///
@@ -103,15 +108,25 @@ pub struct Negamax<G, M, E> {
     evaluator: E,
     /// Options
     pub options: SearchOptions,
+    /// Shared across the iterative deepening passes, so a result found at one
+    /// depth can save work at the next.
+    tt: Tt<M>,
 }
 
-impl<G, M, E> Negamax<G, M, E> {
+impl<G, M: Move, E> Negamax<G, M, E> {
     pub fn new(node: Node<G, M>, evaluator: E, options: SearchOptions) -> Self {
+        let tt = Tt::new(options.tt_bits);
         Negamax {
             node,
             evaluator,
             options,
+            tt,
         }
+    }
+
+    /// Transposition table hits and stores from the last search.
+    pub fn tt_stats(&self) -> (u64, u64) {
+        (self.tt.hits, self.tt.stores)
     }
 
     pub fn replace_gamestate(&mut self, gamestate: G) {
@@ -157,6 +172,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             f32::NEG_INFINITY,
                             f32::INFINITY,
                             self.options,
+                            &mut self.tt,
                         )
                     } else {
                         debug!("Running single threaded negamax with depth {depth}");
@@ -169,6 +185,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             f32::NEG_INFINITY,
                             f32::INFINITY,
                             self.options,
+                            &mut self.tt,
                         )
                     }
                 } else {
@@ -233,6 +250,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     f32::NEG_INFINITY,
                     f32::INFINITY,
                     self.options,
+                    &mut self.tt,
                 )
             } else {
                 debug!("Running single threaded negamax");
@@ -245,6 +263,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     f32::NEG_INFINITY,
                     f32::INFINITY,
                     self.options,
+                    &mut self.tt,
                 )
             }
         } else {
@@ -292,6 +311,10 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     alpha: f32,
     beta: f32,
     opts: SearchOptions,
+    // Accepted for signature parity with the sequential search. The table is
+    // not shared across rayon tasks: each gets its own, so a shared one here
+    // would go unused and hide that.
+    _tt: &mut Tt<M>,
 ) -> SearchExit {
     // Run the negamax search in parallel at this depth
     if depth == 0 {
@@ -353,6 +376,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     c_alpha,
                     c_beta,
                     opts,
+                    &mut Tt::new(0),
                 );
 
                 // Get best out of current and child
@@ -608,8 +632,9 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     expiration: Option<std::time::Instant>,
     aim: NegamaxAim,
     mut alpha: f32,
-    beta: f32,
+    mut beta: f32,
     opts: SearchOptions,
+    tt: &mut Tt<M>,
 ) -> SearchExit {
     if depth == 0 {
         // End of recursion. Checked before move generation: leaves are the bulk
@@ -635,8 +660,47 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 return SearchExit::Time;
             }
         }
+        // Ask the table before doing any work: this position may already have
+        // been searched down a different move order.
+        let key = if tt.enabled() { node.gamestate.position_key() } else { 0 };
+        let alpha_orig = alpha;
+        let mut tt_best: Option<M> = None;
+        if key != 0 {
+            match tt.lookup(key, depth, alpha, beta) {
+                Probe::Cutoff(value, m) => {
+                    node.value = Some(value);
+                    node.best = Some(m);
+                    node.search_depth = depth;
+                    node.descendants = 0;
+                    node.terminals = 0;
+                    node.path_length = 1;
+                    // Deliberately not Exhaustive: a stored value says nothing
+                    // about whether that subtree reached its leaves, and
+                    // claiming otherwise would stop deepening early.
+                    return SearchExit::Depth;
+                }
+                Probe::Hint { alpha: a, beta: b, best } => {
+                    alpha = a;
+                    beta = b;
+                    tt_best = best;
+                }
+                Probe::Miss => {}
+            }
+        }
+
         // continue recursion
         node.reset_stats();
+        // A move that was best for this position elsewhere in the tree is the
+        // best guess here too. ChildrenIter pops from the back, so moving it
+        // last gets it searched first.
+        if let Some(m) = &tt_best {
+            if node.children.is_empty() && !node.moves.is_empty() {
+                if let Some(i) = node.moves.iter().position(|x| x == m) {
+                    let last = node.moves.len() - 1;
+                    node.moves.swap(i, last);
+                }
+            }
+        }
         // Order children by the previous iteration's results before searching.
         // A child stores its value from its own perspective and the parent
         // negates it, so ascending child value puts this node's best move
@@ -682,6 +746,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 c_alpha,
                 c_beta,
                 opts,
+                tt,
             ) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
@@ -735,6 +800,9 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         node.value = Some(best.0);
         node.search_depth = depth;
         node.path_length = best_path.saturating_add(1);
+        if key != 0 {
+            tt.record(key, depth, best.0, alpha_orig, beta, node.best.clone());
+        }
         exit
     }
 }
@@ -744,6 +812,7 @@ mod test {
     use std::result;
 
     use super::{negamax, Negamax};
+    use crate::tt::Tt;
     use crate::{
         games::tictactoe::{Ttt, TttEvaluator, TttMove},
         negamax::{negamax_ab, NegamaxAim, SearchOptions},
@@ -843,7 +912,8 @@ mod test {
                 NegamaxAim::Maximise,
                 f32::NEG_INFINITY,
                 f32::INFINITY,
-                SearchOptions::default()
+                SearchOptions::default(),
+                &mut Tt::new(0)
             ),
             crate::SearchExit::Exhaustive
         );
