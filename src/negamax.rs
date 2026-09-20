@@ -105,13 +105,13 @@ impl<G, M, E> Negamax<G, M, E> {
 impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     /// The move to report from the root, honouring the random selection
     /// options. Falls back to the search's own choice.
-    fn root_move(&self, aim: NegamaxAim) -> M {
+    fn root_move(&self, aim: NegamaxAim) -> (M, f32) {
         if self.options.random_best || self.options.random_weight > 0.0 {
-            if let Some(m) = pick_root_move(&self.node, aim, &self.options) {
-                return m;
+            if let Some(chosen) = pick_root_move(&self.node, aim, &self.options) {
+                return chosen;
             }
         }
-        self.node.best.clone().unwrap()
+        (self.node.best.clone().unwrap(), self.node.value.unwrap())
     }
 
     pub fn search(&mut self) -> SearchResult<M> {
@@ -159,9 +159,10 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                 } {
                     SearchExit::Depth => {
                         // Store result and carry on to next depth
+                        let root = self.root_move(aim);
                         result = Some(SearchResult {
-                            best: self.root_move(aim),
-                            value: self.node.value.unwrap(),
+                            best: root.0,
+                            value: root.1,
                             exit: SearchExit::Depth,
                             nodes: self.node.descendants,
                             terminals: self.node.terminals,
@@ -184,9 +185,10 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     }
                     SearchExit::Exhaustive => {
                         // Full search complete, return result
+                        let root = self.root_move(aim);
                         return SearchResult {
-                            best: self.root_move(aim),
-                            value: self.node.value.unwrap(),
+                            best: root.0,
+                            value: root.1,
                             exit: SearchExit::Exhaustive,
                             nodes: self.node.descendants,
                             terminals: self.node.terminals,
@@ -237,9 +239,10 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             )
         };
 
+        let root = self.root_move(aim);
         SearchResult {
-            best: self.root_move(aim),
-            value: self.node.value.unwrap(),
+            best: root.0,
+            value: root.1,
             exit,
             nodes: self.node.descendants,
             terminals: self.node.terminals,
@@ -414,7 +417,7 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
     node: &Node<G, M>,
     aim: NegamaxAim,
     opts: &SearchOptions,
-) -> Option<M> {
+) -> Option<(M, f32)> {
     use rand::Rng;
     if node.children.is_empty() {
         return None;
@@ -440,33 +443,38 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
         if tied.is_empty() {
             return None;
         }
-        return Some(tied[rng.gen_range(0..tied.len())].clone());
+        // Every candidate ties the best value exactly, so the reported value
+        // is unchanged by the choice.
+        return Some((tied[rng.gen_range(0..tied.len())].clone(), best_value));
     }
 
     if opts.random_weight > 0.0 {
         // weight^(value - best) so each +1 of value is `weight` times likelier.
         let mut total = 0.0f32;
-        let weighted: Vec<(&M, f32)> = node
+        let weighted: Vec<(&M, f32, f32)> = node
             .children
             .iter()
             .filter(|(_, c)| c.search_depth == best_depth)
             .map(|(m, c)| {
+                let v = parent_view(c, aim);
                 let w = opts
                     .random_weight
-                    .powf(parent_view(c, aim) - best_value)
+                    .powf(v - best_value)
                     .clamp(f32::MIN_POSITIVE, f32::MAX);
                 total += w;
-                (m, w)
+                (m, w, v)
             })
             .collect();
         if weighted.is_empty() || !total.is_finite() || total <= 0.0 {
             return None;
         }
         let mut pick = rng.gen_range(0.0..total);
-        for (m, w) in weighted {
+        for (m, w, v) in weighted {
             pick -= w;
             if pick <= 0.0 {
-                return Some(m.clone());
+                // Report the value of the move actually chosen. This can be
+                // below the root's best, which is the point of the option.
+                return Some((m.clone(), v));
             }
         }
     }
@@ -824,6 +832,65 @@ mod test {
         let result = n.search();
         println!("{:?}", result);
         assert_eq!(result.best, TttMove::from(4));
+    }
+
+    /// The reported value must describe the move actually returned.
+    /// `random_best` only ever picks exact ties, so it cannot move the value;
+    /// `random_weight` can pick a worse move and must then say so.
+    #[test]
+    fn random_selection_value_matches_chosen_move() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let base = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            pre_sort: true,
+            max_depth: Some(4),
+            ..Default::default()
+        };
+
+        let deterministic = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, base)
+            .search()
+            .value;
+
+        // Ties only: the value can never differ from the deterministic best.
+        for _ in 0..50 {
+            let r = Negamax::new(
+                Node::new(Mancala::new()),
+                MancalaEvaluator,
+                SearchOptions { random_best: true, ..base },
+            )
+            .search();
+            assert_eq!(
+                r.value, deterministic,
+                "random_best must only choose between equally valued moves"
+            );
+        }
+
+        // Weighted: sometimes picks a worse move, and must report that move's
+        // value rather than the root's best. Never better than the best.
+        let mut saw_worse = false;
+        for _ in 0..200 {
+            let r = Negamax::new(
+                Node::new(Mancala::new()),
+                MancalaEvaluator,
+                SearchOptions { random_weight: 1.2, ..base },
+            )
+            .search();
+            assert!(
+                r.value <= deterministic,
+                "reported value {} exceeds the best {}",
+                r.value,
+                deterministic
+            );
+            if r.value < deterministic {
+                saw_worse = true;
+            }
+        }
+        assert!(
+            saw_worse,
+            "random_weight never reported a below-best value, so value is not tracking the choice"
+        );
     }
 
     #[test]
