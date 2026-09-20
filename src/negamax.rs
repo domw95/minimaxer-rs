@@ -287,24 +287,32 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             .par_iter_mut()
             .zip(evaluators)
             .map(|((m, child), mut evaluator)| {
+                // Only flip the window when the turn actually passes over.
+                let child_aim = NegamaxAim::from(child.gamestate.player_aim());
+                let a_now = alpha.load(Ordering::Relaxed);
+                let (c_aim, c_alpha, c_beta) = if child_aim == aim {
+                    (aim, a_now, beta)
+                } else {
+                    (-aim, -beta, -a_now)
+                };
                 // Recurse with child node and remember best
                 let exit = negamax_ab(
                     child,
                     &mut evaluator,
                     depth - 1,
                     expiration,
-                    -aim,
-                    -beta,
-                    -alpha.load(Ordering::Relaxed),
+                    c_aim,
+                    c_alpha,
+                    c_beta,
                     pre_sort,
                 );
 
                 // Get best out of current and child
-                let value = -child.value.unwrap();
+                let value = parent_view(child, aim);
 
-                // Store larger of alpha and value in alpha
-                let a = alpha.load(Ordering::Acquire);
-                alpha.store(a.max(value), Ordering::Release);
+                // Raise alpha atomically; a load/store pair loses concurrent
+                // updates and silently weakens pruning.
+                alpha.fetch_max(value, Ordering::AcqRel);
 
                 // Return result
                 let result = ParallelResult {
@@ -349,6 +357,25 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     }
 }
 
+/// A child's value as the parent sees it.
+///
+/// Most games alternate turns, so the child's value is negated. Games that
+/// can grant a repeat turn (Kalah landing its last stone in its own store)
+/// produce children with the same player to move, and those must not be
+/// flipped.
+fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: NegamaxAim) -> f32 {
+    match child.value {
+        Some(v) => {
+            if NegamaxAim::from(child.gamestate.player_aim()) == parent_aim {
+                v
+            } else {
+                -v
+            }
+        }
+        None => f32::NEG_INFINITY,
+    }
+}
+
 /// Negamax search, no pruning or timeout
 pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     node: &mut Node<G, M>,
@@ -383,7 +410,8 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         for (m, child) in node.into_iter() {
             // Clone gamestate to make child
             // Recurse with child node and remember best
-            match negamax(child, evaluator, depth - 1, -aim) {
+            let child_aim = NegamaxAim::from(child.gamestate.player_aim());
+            match negamax(child, evaluator, depth - 1, child_aim) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
@@ -397,7 +425,7 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 SearchExit::Exhaustive => {}
             };
             // Get best out of current and child
-            let value = -child.value.unwrap();
+            let value = parent_view(child, aim);
             if value > best.0 {
                 best = (value, Some(m.clone()));
             }
@@ -454,7 +482,11 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // negates it, so ascending child value puts this node's best move
         // first, which is what makes alpha-beta cut off early.
         if pre_sort && !node.children.is_empty() {
-            node.sort_children_ascending();
+            node.children.sort_by(|(_, a), (_, b)| {
+                parent_view(b, aim)
+                    .partial_cmp(&parent_view(a, aim))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         // track best value and move
         let mut best = (f32::NEG_INFINITY, None);
@@ -467,14 +499,21 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         for (m, child) in node.into_iter() {
             trace!("Exploring move {m:?} at depth {depth}");
             // Recurse with child node and remember best
+            // Only flip the window when the turn actually passes over.
+            let child_aim = NegamaxAim::from(child.gamestate.player_aim());
+            let (c_aim, c_alpha, c_beta) = if child_aim == aim {
+                (aim, alpha, beta)
+            } else {
+                (-aim, -beta, -alpha)
+            };
             match negamax_ab(
                 child,
                 evaluator,
                 depth - 1,
                 expiration,
-                -aim,
-                -beta,
-                -alpha,
+                c_aim,
+                c_alpha,
+                c_beta,
                 pre_sort,
             ) {
                 SearchExit::Depth => {
@@ -491,7 +530,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             };
 
             // Get best out of current and child
-            let value = -child.value.unwrap();
+            let value = parent_view(child, aim);
             if value > best.0 {
                 best = (value, Some(m.clone()));
             }
