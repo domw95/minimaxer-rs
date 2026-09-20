@@ -73,6 +73,23 @@ pub struct SearchOptions {
     /// Pick randomly between root moves, weighted towards better values.
     /// `w` makes each +1 of value `w` times more likely. 0 disables.
     pub random_weight: f32,
+    /// Order children by their own static evaluation the first time a node is
+    /// expanded.
+    ///
+    /// `pre_sort` can only order children a previous iteration has already
+    /// given a value to, so the very first visit to a node searches them in
+    /// whatever order move generation produced. Alpha-beta only cuts off once
+    /// a good move has been found, so that first ordering decides how much of
+    /// the subtree is skipped. Costs one evaluation per child, and forces all
+    /// children to be created rather than generated lazily.
+    pub sort_on_create: bool,
+    /// Only pay for `sort_on_create` when at least this much depth remains.
+    ///
+    /// Creating every child costs a clone and a move application each, which
+    /// is wasted on any child alpha-beta then cuts off. Near the leaves the
+    /// subtree saved is too small to repay that, so the ordering only earns
+    /// its keep higher up. 0 applies it everywhere.
+    pub sort_on_create_min_depth: u8,
     /// Stop cutting off on `alpha == beta`, so equal-valued siblings survive
     /// to be chosen between. Required for `prune_by_path_length` to see
     /// alternatives, and widens `random_best`. Costs a lot of nodes when the
@@ -624,7 +641,17 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // A child stores its value from its own perspective and the parent
         // negates it, so ascending child value puts this node's best move
         // first, which is what makes alpha-beta cut off early.
-        if opts.pre_sort && !node.children.is_empty() {
+        if opts.sort_on_create && node.children.is_empty() && depth >= opts.sort_on_create_min_depth
+        {
+            // First visit: nothing has an inherited value yet, so fall back to
+            // each child's own static evaluation rather than move order.
+            node.create_all_children();
+            for (_, child) in node.children.iter_mut() {
+                let child_aim = NegamaxAim::from(child.gamestate.player_aim());
+                child.evaluate(evaluator, child_aim.into());
+            }
+            order_children(node, aim, opts.prune_by_path_length);
+        } else if opts.pre_sort && !node.children.is_empty() {
             order_children(node, aim, opts.prune_by_path_length);
         }
         // track best value and move
