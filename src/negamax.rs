@@ -527,6 +527,12 @@ mod test {
 
     use test_log::test;
 
+    /// Perfect play from an empty board draws, so every opening move scores
+    /// 0.0 and `best` is decided purely by tie-break: the search keeps the
+    /// first move it sees (strict `>`), and `ChildrenIter` pops moves off the
+    /// back of the list, so move 8 wins. These assertions therefore pin
+    /// iteration order, not game-theoretic correctness -- the meaningful
+    /// assertion is the terminal count.
     #[test]
     fn negamax_ttt() {
         // Create a game
@@ -540,7 +546,7 @@ mod test {
             negamax(&mut node, &mut evaluator, 9, NegamaxAim::Maximise),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         assert_eq!(node.terminals, 255168);
 
         // player 2
@@ -554,7 +560,7 @@ mod test {
             negamax(&mut node, &mut evaluator, 9, NegamaxAim::Minimise),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         assert_eq!(node.terminals, 255168);
 
         //  Repeated calls
@@ -564,19 +570,19 @@ mod test {
             negamax(&mut node, &mut evaluator, 2, NegamaxAim::Maximise),
             crate::SearchExit::Depth
         );
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         assert_eq!(
             negamax(&mut node, &mut evaluator, 6, NegamaxAim::Maximise),
             crate::SearchExit::Depth
         );
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         assert_eq!(
             negamax(&mut node, &mut evaluator, 9, NegamaxAim::Maximise),
             crate::SearchExit::Exhaustive
         );
         dbg!(node.children.len());
         dbg!(node.descendants);
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         assert_eq!(node.terminals, 255168);
     }
 
@@ -592,6 +598,8 @@ mod test {
         }
     }
 
+    /// See `negamax_ttt`: `best` here is the tie-break winner among nine
+    /// drawing opening moves, not a uniquely correct answer.
     #[test]
     fn ttt_alpha_beta() {
         // Create a game
@@ -614,7 +622,7 @@ mod test {
             ),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(0)));
+        assert_eq!(node.best, Some(TttMove::from(8)));
         // assert_eq!(node.terminals, 255168);
 
         let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, Default::default());
