@@ -133,6 +133,10 @@ impl Gamestate<TttMove> for Ttt {
         self.play_move(*m);
     }
 
+    fn is_terminal(&mut self) -> bool {
+        self.check_win().is_some() || self.grid.iter().all(|c| !matches!(c, Cell::Empty))
+    }
+
     fn player_aim(&self) -> crate::NodeAim {
         match self.activeplayer {
             Player::One => crate::NodeAim::Maximise,

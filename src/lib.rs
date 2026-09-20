@@ -41,6 +41,15 @@ pub trait Gamestate<M>: Clone + Send + Sync {
     fn play_move(&mut self, m: &M);
     /// Get the aim of the current player
     fn player_aim(&self) -> NodeAim;
+    /// Cheap check for whether the game has ended here.
+    ///
+    /// Called at every leaf, which is the bulk of the search tree. The default
+    /// generates the move list and throws it away; override it with a direct
+    /// test to avoid that work. For a game whose move generation allocates,
+    /// doing so is worth a large constant factor on the whole search.
+    fn is_terminal(&mut self) -> bool {
+        self.get_moves().is_empty()
+    }
 }
 
 pub trait Evaluate<G>: Clone + Send + Sync {

@@ -114,6 +114,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
+                            self.options.pre_sort,
                         )
                     } else {
                         debug!("Running single threaded negamax with depth {depth}");
@@ -125,6 +126,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
+                            self.options.pre_sort,
                         )
                     }
                 } else {
@@ -141,6 +143,11 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             time: start.elapsed(),
                             depth: self.node.search_depth,
                         });
+                        // Stop once the requested depth has been completed,
+                        // otherwise a search with no time limit never returns.
+                        if self.options.max_depth.is_some_and(|max| depth >= max) {
+                            return result.unwrap();
+                        }
                         depth += 1;
                     }
                     SearchExit::Time => {
@@ -181,6 +188,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     aim,
                     f32::NEG_INFINITY,
                     f32::INFINITY,
+                    self.options.pre_sort,
                 )
             } else {
                 debug!("Running single threaded negamax");
@@ -192,6 +200,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     aim,
                     f32::NEG_INFINITY,
                     f32::INFINITY,
+                    self.options.pre_sort,
                 )
             }
         } else {
@@ -237,16 +246,23 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     aim: NegamaxAim,
     alpha: f32,
     beta: f32,
+    pre_sort: bool,
 ) -> SearchExit {
     // Run the negamax search in parallel at this depth
-    if node.get_moves() == 0 {
+    if depth == 0 {
+        // End of recursion. Checked before move generation: leaves are the bulk
+        // of the tree and generating their moves only to discard them dominates
+        // the search when the move generator allocates.
+        node.evaluate(evaluator, aim.into());
+        if node.gamestate.is_terminal() {
+            SearchExit::Terminal
+        } else {
+            SearchExit::Depth
+        }
+    } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
         SearchExit::Terminal
-    } else if depth == 0 {
-        // end of recursion, evaluate the gamestate
-        node.evaluate(evaluator, aim.into());
-        SearchExit::Depth
     } else {
         // Check expiration
         if let Some(expire) = expiration {
@@ -280,6 +296,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     -aim,
                     -beta,
                     -alpha.load(Ordering::Relaxed),
+                    pre_sort,
                 );
 
                 // Get best out of current and child
@@ -339,14 +356,20 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     depth: u8,
     aim: NegamaxAim,
 ) -> SearchExit {
-    if node.get_moves() == 0 {
+    if depth == 0 {
+        // End of recursion. Checked before move generation: leaves are the bulk
+        // of the tree and generating their moves only to discard them dominates
+        // the search when the move generator allocates.
+        node.evaluate(evaluator, aim.into());
+        if node.gamestate.is_terminal() {
+            SearchExit::Terminal
+        } else {
+            SearchExit::Depth
+        }
+    } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
         SearchExit::Terminal
-    } else if depth == 0 {
-        // end of recursion, evaluate the gamestate
-        node.evaluate(evaluator, aim.into());
-        SearchExit::Depth
     } else {
         // continue recursion
         node.reset_stats();
@@ -401,15 +424,22 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     aim: NegamaxAim,
     mut alpha: f32,
     beta: f32,
+    pre_sort: bool,
 ) -> SearchExit {
-    if node.get_moves() == 0 {
+    if depth == 0 {
+        // End of recursion. Checked before move generation: leaves are the bulk
+        // of the tree and generating their moves only to discard them dominates
+        // the search when the move generator allocates.
+        node.evaluate(evaluator, aim.into());
+        if node.gamestate.is_terminal() {
+            SearchExit::Terminal
+        } else {
+            SearchExit::Depth
+        }
+    } else if node.get_moves() == 0 {
         // Game end condition, evaluate the gamestate
         node.evaluate(evaluator, aim.into());
         SearchExit::Terminal
-    } else if depth == 0 {
-        // end of recursion, evaluate the gamestate
-        node.evaluate(evaluator, aim.into());
-        SearchExit::Depth
     } else {
         // Check expiration
         if let Some(expire) = expiration {
@@ -419,6 +449,13 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         }
         // continue recursion
         node.reset_stats();
+        // Order children by the previous iteration's results before searching.
+        // A child stores its value from its own perspective and the parent
+        // negates it, so ascending child value puts this node's best move
+        // first, which is what makes alpha-beta cut off early.
+        if pre_sort && !node.children.is_empty() {
+            node.sort_children_ascending();
+        }
         // track best value and move
         let mut best = (f32::NEG_INFINITY, None);
         // Assume exhaustive first, any time or depth will override
@@ -430,7 +467,16 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         for (m, child) in node.into_iter() {
             trace!("Exploring move {m:?} at depth {depth}");
             // Recurse with child node and remember best
-            match negamax_ab(child, evaluator, depth - 1, expiration, -aim, -beta, -alpha) {
+            match negamax_ab(
+                child,
+                evaluator,
+                depth - 1,
+                expiration,
+                -aim,
+                -beta,
+                -alpha,
+                pre_sort,
+            ) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
@@ -563,7 +609,8 @@ mod test {
                 None,
                 NegamaxAim::Maximise,
                 f32::NEG_INFINITY,
-                f32::INFINITY
+                f32::INFINITY,
+                false
             ),
             crate::SearchExit::Exhaustive
         );
