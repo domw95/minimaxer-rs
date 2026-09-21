@@ -142,18 +142,6 @@ impl<G, M> Arena<G, M> {
         self.len -= dropped;
     }
 
-    /// Hand back any chunk the arena is no longer using.
-    ///
-    /// Truncation leaves the emptied chunks allocated, which is what keeps a
-    /// search that repeatedly grows and shrinks from churning through `mmap`.
-    /// Between passes that is just held memory, so this releases it.
-    pub fn shrink(&mut self) {
-        while self.chunks.last().is_some_and(|c| c.is_empty()) {
-            self.chunks.pop();
-        }
-        self.chunks.shrink_to_fit();
-    }
-
     /// Move a node out, leaving the slot empty. Only for migration: any other
     /// id still pointing at this node is now dangling in the logical sense and
     /// will panic on access rather than read stale data.

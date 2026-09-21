@@ -17,9 +17,21 @@ use crate::{node::Node, Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchRe
 /// Between passes the tree holds two quite different things: the move ordering
 /// that makes alpha-beta cut off early, and the nodes that ordering was
 /// derived from. Only the first is needed by the next pass. Removal writes the
-/// ordering back into each node's move list and then throws the nodes away,
-/// which is what stops memory growing with the union of every pass rather than
-/// with the last one.
+/// ordering back into each node's move list and then throws the nodes away.
+///
+/// **This does not reduce peak memory, and at depth it increases it.** Peak is
+/// reached at the end of the deepest pass, and removal runs between passes, so
+/// the most it can ever save is what the earlier passes left behind that the
+/// last one does not revisit. On Azul that ceiling is 1.57x at cap 6 and only
+/// 1.126x at cap 7 -- it shrinks as the search deepens, because with good
+/// ordering the last pass dominates everything before it. Against that,
+/// regenerating the discarded subtrees costs 1.4x the nodes. Measured, the
+/// tree at the end of the search goes 433,248 -> 390,012 at cap 6 (0.90x) and
+/// 1,717,603 -> 2,084,931 at cap 7 (1.21x). Kalah is the same shape.
+///
+/// [`SearchOptions::retain_depth`] is the option that bounds memory; this one
+/// is kept for parity with the TypeScript original and because it is the
+/// right shape for a game whose last pass does *not* dominate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalMethod {
     /// Keep every node. The default, and the behaviour before removal existed.
@@ -164,13 +176,10 @@ pub struct SearchOptions {
     /// which is the default and the behaviour before this existed.
     ///
     /// This is the option that bounds memory, and it is a different lever
-    /// from [`RemovalMethod`]. Removal runs *between* deepening passes, so it
-    /// cannot touch the pass that actually sets the high-water mark: measured
-    /// on Azul it made the final tree 0.90x at cap 6 and 1.21x at cap 7,
-    /// because the nodes it saves from earlier passes cost more than that to
-    /// regenerate. Peak memory is reached at the end of the deepest pass, so
-    /// the only thing that moves it is not keeping those nodes in the first
-    /// place.
+    /// from [`RemovalMethod`], which runs between passes and so cannot touch
+    /// the pass that sets the high-water mark. Peak is reached at the end of
+    /// the deepest pass, so the only thing that moves it is not keeping those
+    /// nodes in the first place.
     ///
     /// So: a node this deep or deeper hands its children's moves back to its
     /// own move list, in the order the search ranked them, and drops the
@@ -549,6 +558,7 @@ struct ParallelResult<M> {
     terminals: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     arena: &mut Arena<G, M>,
     id: NodeId,
@@ -737,13 +747,6 @@ fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: Negamax
         None => f32::NEG_INFINITY,
     }
 }
-
-/// Re-pick the root move among equally good alternatives.
-///
-/// The search keeps the first move that beats the incumbent, so a
-/// deterministic engine replays the same game forever. That is poor value as
-/// a training opponent, hence the option to spread the choice over moves the
-/// search cannot separate.
 
 /// Re-pick the root move among equally good alternatives.
 ///
@@ -1845,13 +1848,55 @@ mod test {
             let node = n.arena().get(id);
             let mut all: Vec<_> = node.moves.clone();
             for (m, child) in &node.children {
-                all.push(m.clone());
+                all.push(*m);
                 stack.push(*child);
             }
             let mut legal = crate::Gamestate::get_moves(&mut node.gamestate.clone());
             all.sort_by_key(|m| m.0);
             legal.sort_by_key(|m| m.0);
             assert_eq!(all, legal, "a collapsed node lost or duplicated a move");
+        }
+    }
+
+    /// Re-rooting onto a played move has to work against a bounded tree too.
+    /// The kept subtree is only `retain_depth` plies deep, so after a couple
+    /// of moves the search is re-rooting onto nodes that were the deepest
+    /// thing retained -- collapsed, with children gone and their moves handed
+    /// back. Playing a whole game through that path must still agree move for
+    /// move with an unbounded tree.
+    #[test]
+    fn retain_depth_survives_re_rooting() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let base = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            pre_sort: true,
+            max_depth: Some(6),
+            ..Default::default()
+        };
+        let mut full = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, base);
+        let mut bounded = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions { retain_depth: 2, ..base },
+        );
+
+        for ply in 0..20 {
+            let a = full.search();
+            let b = bounded.search();
+            assert_eq!(a.value, b.value, "values diverged at ply {ply}");
+            assert_eq!(a.best, b.best, "moves diverged at ply {ply}");
+            // The bounded tree must stay bounded across re-rootings rather
+            // than creeping up as stale subtrees accumulate.
+            assert!(
+                bounded.tree_size() < full.tree_size(),
+                "bounded tree {} is not smaller than the full one {} at ply {ply}",
+                bounded.tree_size(),
+                full.tree_size()
+            );
+            full.play_move(&a.best);
+            bounded.play_move(&b.best);
         }
     }
 }
