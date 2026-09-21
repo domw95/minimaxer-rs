@@ -160,6 +160,37 @@ pub struct SearchOptions {
     pub removal_depth: u8,
     /// Tree size at or above which [`RemovalMethod::Count`] removes.
     pub removal_count: u32,
+    /// Keep the tree only this many plies below the root. 0 keeps all of it,
+    /// which is the default and the behaviour before this existed.
+    ///
+    /// This is the option that bounds memory, and it is a different lever
+    /// from [`RemovalMethod`]. Removal runs *between* deepening passes, so it
+    /// cannot touch the pass that actually sets the high-water mark: measured
+    /// on Azul it made the final tree 0.90x at cap 6 and 1.21x at cap 7,
+    /// because the nodes it saves from earlier passes cost more than that to
+    /// regenerate. Peak memory is reached at the end of the deepest pass, so
+    /// the only thing that moves it is not keeping those nodes in the first
+    /// place.
+    ///
+    /// So: a node this deep or deeper hands its children's moves back to its
+    /// own move list, in the order the search ranked them, and drops the
+    /// children. Because the search is depth first, everything it allocated
+    /// is above a mark taken on the way in, and dropping it is an arena
+    /// truncation rather than a traversal. The tree left standing is the top
+    /// `retain_depth` plies, and the live set during a pass is that plus one
+    /// frontier of siblings per level of the current path -- bounded by the
+    /// depth, not by the nodes searched.
+    ///
+    /// The ordering of the retained nodes survives in full, which is better
+    /// than removal manages: every node keeps its complete ranked move list
+    /// rather than one best child. What is lost is the ordering *below*
+    /// `retain_depth`, which the transposition table is the right thing to
+    /// carry. Ordering matters most near the root -- a cutoff one ply down
+    /// skips a whole subtree -- so the top plies are where retention earns
+    /// its keep.
+    ///
+    /// Applies to the alpha-beta search only.
+    pub retain_depth: u8,
 }
 
 /// Negamax search with pruning and timeout
@@ -287,6 +318,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             f32::INFINITY,
                             self.options,
                             &mut self.tt,
+                            0,
                         )
                     } else {
                         debug!("Running single threaded negamax with depth {depth}");
@@ -301,6 +333,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             f32::INFINITY,
                             self.options,
                             &mut self.tt,
+                            0,
                         )
                     }
                 } else {
@@ -373,6 +406,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     f32::INFINITY,
                     self.options,
                     &mut self.tt,
+                    0,
                 )
             } else {
                 debug!("Running single threaded negamax");
@@ -387,6 +421,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     f32::INFINITY,
                     self.options,
                     &mut self.tt,
+                    0,
                 )
             }
         } else {
@@ -528,6 +563,8 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     // not shared across rayon tasks: each gets its own, so a shared one here
     // would go unused and hide that.
     _tt: &mut Tt<M>,
+    // Signature parity again: the parallel root is always ply 0.
+    _ply: u8,
 ) -> SearchExit {
     // Run the negamax search in parallel at this depth
     if depth == 0 {
@@ -611,6 +648,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     c_beta,
                     opts,
                     &mut Tt::new(0),
+                    1,
                 );
 
                 // Get best out of current and child
@@ -999,6 +1037,9 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     mut beta: f32,
     opts: SearchOptions,
     tt: &mut Tt<M>,
+    // Plies from the root of this search; 0 at the root. Only
+    // `SearchOptions::retain_depth` uses it.
+    ply: u8,
 ) -> SearchExit {
     if depth == 0 {
         // End of recursion. Checked before move generation: leaves are the bulk
@@ -1026,6 +1067,11 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 return SearchExit::Time;
             }
         }
+        // Where the arena ends before this node allocates anything. The
+        // search is depth first, so everything below this node ends up above
+        // this mark and can be dropped by truncating back to it.
+        let mark = arena.mark();
+        let had_children = !arena.get(id).children.is_empty();
         // Ask the table before doing any work: this position may already have
         // been searched down a different move order.
         let key = if tt.enabled() {
@@ -1125,6 +1171,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 c_beta,
                 opts,
                 tt,
+                ply.saturating_add(1),
             ) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
@@ -1186,7 +1233,45 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             let best_move = node.best.clone();
             tt.record(key, depth, best.0, alpha_orig, beta, best_move);
         }
+        if opts.retain_depth != 0 && ply >= opts.retain_depth {
+            collapse_children(arena, id, aim, opts, ply);
+            // Only safe when every node above the mark belongs to this
+            // subtree. A node carrying children from a previous pass has them
+            // somewhere else in the arena, so leave those to the next
+            // migration rather than truncating over the top of them.
+            if !had_children {
+                arena.truncate(mark);
+            }
+        }
         exit
+    }
+}
+
+/// Hand a node's children back to it as ranked moves and drop them.
+///
+/// The node keeps everything the next pass needs from those children -- their
+/// order -- and none of their storage. Only the shallowest collapsing level
+/// is worth ranking: anything deeper is about to be dropped by its own parent
+/// doing the same thing, so ordering it would be work thrown away.
+fn collapse_children<G: Gamestate<M>, M: Move>(
+    arena: &mut Arena<G, M>,
+    id: NodeId,
+    aim: NegamaxAim,
+    opts: SearchOptions,
+    ply: u8,
+) {
+    if arena.get(id).children.is_empty() {
+        return;
+    }
+    if ply == opts.retain_depth {
+        order_children(arena, id, aim, opts.prune_by_path_length);
+    }
+    let children = std::mem::take(&mut arena.get_mut(id).children);
+    if ply == opts.retain_depth {
+        // Popped from the back, so reversed here means played in ranked order.
+        let mut moves: Vec<M> = children.into_iter().map(|(m, _)| m).collect();
+        moves.reverse();
+        arena.get_mut(id).moves.append(&mut moves);
     }
 }
 
@@ -1298,7 +1383,8 @@ mod test {
                 f32::NEG_INFINITY,
                 f32::INFINITY,
                 SearchOptions::default(),
-                &mut Tt::new(0)
+                &mut Tt::new(0),
+                0
             ),
             crate::SearchExit::Exhaustive
         );
@@ -1652,5 +1738,120 @@ mod test {
             checked += 1;
         }
         assert!(checked > 1);
+    }
+
+
+    /// Bounding the tree's depth must not change the answer either: it only
+    /// decides which nodes are kept, not which are searched.
+    #[test]
+    fn retain_depth_does_not_change_the_value() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        for depth in 1..=10u8 {
+            for retain in [1u8, 2, 3] {
+                let base = SearchOptions {
+                    alpha_beta: true,
+                    iterative: true,
+                    pre_sort: true,
+                    max_depth: Some(depth),
+                    ..Default::default()
+                };
+                let full = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, base).search();
+                let bounded = Negamax::new(
+                    Node::new(Mancala::new()),
+                    MancalaEvaluator,
+                    SearchOptions { retain_depth: retain, ..base },
+                )
+                .search();
+                assert_eq!(
+                    full.value, bounded.value,
+                    "retain_depth {retain} changed the value at depth {depth}"
+                );
+                assert_eq!(full.exit, bounded.exit);
+            }
+        }
+    }
+
+    /// The tree left standing is the top `retain_depth` plies and nothing
+    /// else, whatever depth the search ran to. That is the property that
+    /// makes memory independent of how deep the search goes.
+    #[test]
+    fn retain_depth_bounds_the_tree() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let mut sizes = Vec::new();
+        for depth in [8u8, 10, 12] {
+            let mut n = Negamax::new(
+                Node::new(Mancala::new()),
+                MancalaEvaluator,
+                SearchOptions {
+                    alpha_beta: true,
+                    iterative: true,
+                    pre_sort: true,
+                    max_depth: Some(depth),
+                    retain_depth: 2,
+                    ..Default::default()
+                },
+            );
+            let r = n.search();
+
+            // Nothing below ply 2 survives.
+            let mut stack = vec![(n.root_id(), 0u8)];
+            let mut deepest = 0;
+            while let Some((id, ply)) = stack.pop() {
+                deepest = deepest.max(ply);
+                for (_, child) in &n.arena().get(id).children {
+                    stack.push((*child, ply + 1));
+                }
+            }
+            assert!(deepest <= 2, "kept a node at ply {deepest} with retain_depth 2");
+            sizes.push((depth, n.tree_size(), r.nodes));
+        }
+
+        // And it does not grow with the depth searched, which is the whole
+        // point: the unbounded tree grows with the node count.
+        let (_, shallow, shallow_nodes) = sizes[0];
+        let (_, deep, deep_nodes) = sizes[2];
+        assert!(
+            deep < shallow * 3,
+            "tree went {shallow} -> {deep} while nodes went {shallow_nodes} -> {deep_nodes}"
+        );
+    }
+
+    /// Collapsing a node hands its children back as moves. If that ever
+    /// regenerated the move list instead of appending to it, or lost a move,
+    /// the next pass would search a different set of moves -- which the value
+    /// assertions above would catch only by luck.
+    #[test]
+    fn collapsed_nodes_keep_every_move() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let mut n = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions {
+                alpha_beta: true,
+                iterative: true,
+                pre_sort: true,
+                max_depth: Some(9),
+                retain_depth: 2,
+                ..Default::default()
+            },
+        );
+        n.search();
+
+        let mut stack = vec![n.root_id()];
+        while let Some(id) = stack.pop() {
+            let node = n.arena().get(id);
+            let mut all: Vec<_> = node.moves.clone();
+            for (m, child) in &node.children {
+                all.push(m.clone());
+                stack.push(*child);
+            }
+            let mut legal = crate::Gamestate::get_moves(&mut node.gamestate.clone());
+            all.sort_by_key(|m| m.0);
+            legal.sort_by_key(|m| m.0);
+            assert_eq!(all, legal, "a collapsed node lost or duplicated a move");
+        }
     }
 }

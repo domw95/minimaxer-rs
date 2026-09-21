@@ -18,6 +18,19 @@ use crate::node::Node;
 /// Index of a node in an [`Arena`].
 pub type NodeId = u32;
 
+/// A point in an arena's allocation order, for [`Arena::truncate`].
+///
+/// The search is depth first, so everything allocated while one child is
+/// being searched sits above the mark taken before it started. Freeing that
+/// subtree is therefore a truncation rather than a traversal, which is what
+/// lets the search keep only the top of the tree without paying to walk the
+/// part it drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    chunks: usize,
+    last_len: usize,
+}
+
 /// Nodes per chunk.
 ///
 /// Chunks are allocated at full capacity and never grow, so a node never moves
@@ -97,6 +110,48 @@ impl<G, M> Arena<G, M> {
         self.chunks[(id >> CHUNK_BITS) as usize][(id & CHUNK_MASK) as usize]
             .as_mut()
             .expect("node was migrated out of this arena")
+    }
+
+    /// The current end of the arena, to truncate back to later.
+    #[inline]
+    pub fn mark(&self) -> Mark {
+        Mark {
+            chunks: self.chunks.len(),
+            last_len: self.chunks.last().map_or(0, |c| c.len()),
+        }
+    }
+
+    /// Drop everything allocated since `mark`.
+    ///
+    /// The caller is responsible for there being no live `NodeId` above the
+    /// mark -- in the search that means the node whose children are being
+    /// dropped has had its children list cleared first.
+    pub fn truncate(&mut self, mark: Mark) {
+        let mut dropped = 0;
+        while self.chunks.len() > mark.chunks {
+            let chunk = self.chunks.pop().expect("len > mark.chunks >= 0");
+            dropped += chunk.iter().filter(|slot| slot.is_some()).count();
+        }
+        if let Some(last) = self.chunks.last_mut() {
+            while last.len() > mark.last_len {
+                if last.pop().expect("len > mark.last_len >= 0").is_some() {
+                    dropped += 1;
+                }
+            }
+        }
+        self.len -= dropped;
+    }
+
+    /// Hand back any chunk the arena is no longer using.
+    ///
+    /// Truncation leaves the emptied chunks allocated, which is what keeps a
+    /// search that repeatedly grows and shrinks from churning through `mmap`.
+    /// Between passes that is just held memory, so this releases it.
+    pub fn shrink(&mut self) {
+        while self.chunks.last().is_some_and(|c| c.is_empty()) {
+            self.chunks.pop();
+        }
+        self.chunks.shrink_to_fit();
     }
 
     /// Move a node out, leaving the slot empty. Only for migration: any other
