@@ -76,12 +76,29 @@ impl<G: Gamestate<M>, M: Move> Node<G, M> {
         self.moves.len() + self.children.len()
     }
 
-    /// Play a move, consuming the node.
-    /// Returns the child node resulting from the move
-    /// with the rest of the tree in place
-    pub fn advance(&mut self, m: &M) {
-        let mut child = self.children.drain(..).find(|(mov, _)| mov == m).unwrap().1;
-        mem::swap(self, &mut child);
+    /// Play a move, re-rooting this node onto the subtree for that move and
+    /// dropping the rest of the tree.
+    ///
+    /// Returns whether an existing subtree was found and kept. A search that
+    /// ran out of time can stop before expanding every root move, and
+    /// analysing a recorded game plays the move from the record rather than
+    /// the one the search chose, so the move asked for may never have been
+    /// expanded. In that case the node is rebuilt from the move instead, with
+    /// no children and `search_depth` back at 0, which is the same position
+    /// the caller would have got by constructing a fresh node.
+    pub fn advance(&mut self, m: &M) -> bool {
+        match self.children.iter().position(|(mov, _)| mov == m) {
+            Some(i) => {
+                let mut child = self.children.swap_remove(i).1;
+                mem::swap(self, &mut child);
+                true
+            }
+            None => {
+                let mut child = self.play_move(m);
+                mem::swap(self, &mut child);
+                false
+            }
+        }
     }
 
     /// Play a move, cloning the node.

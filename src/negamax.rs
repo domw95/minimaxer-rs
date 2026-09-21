@@ -95,6 +95,26 @@ pub struct SearchOptions {
     /// subtree saved is too small to repay that, so the ordering only earns
     /// its keep higher up. 0 applies it everywhere.
     pub sort_on_create_min_depth: u8,
+    /// Start iterative deepening from this depth instead of 1.
+    ///
+    /// Each deepening pass exists to leave behind the move ordering the next
+    /// one relies on. When the tree has already been searched -- the subtree
+    /// kept by `Negamax::play_move`, or a warm transposition table -- that
+    /// ordering is already there and the early passes only redo it.
+    ///
+    /// 0 and 1 both mean "start at 1", the unchanged behaviour. Skipping is
+    /// only sound as far as the existing ordering reaches: starting cold at a
+    /// high depth searches the unordered worst-case tree and is far slower
+    /// than deepening into it. So unless the transposition table has
+    /// something in it, the request is clamped to one past the depth the
+    /// retained tree was actually searched to, which is exactly one deepening
+    /// step. `u8::MAX` therefore means "as deep as the retained tree allows".
+    /// The request is also clamped to `max_depth`.
+    ///
+    /// The first pass is run without the time limit, as it always was, so
+    /// that there is a result to return; with a high `initial_depth` and
+    /// nothing to order by, that first pass can overrun `max_time`.
+    pub initial_depth: u8,
     /// Stop cutting off on `alpha == beta`, so equal-valued siblings survive
     /// to be chosen between. Required for `prune_by_path_length` to see
     /// alternatives, and widens `random_best`. Costs a lot of nodes when the
@@ -146,6 +166,27 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         (self.node.best.clone().unwrap(), self.node.value.unwrap())
     }
 
+    /// Depth for the first iterative deepening pass. See
+    /// [`SearchOptions::initial_depth`] for why the request is clamped.
+    fn start_depth(&self) -> u8 {
+        let requested = self.options.initial_depth;
+        if requested <= 1 {
+            return 1;
+        }
+        // The retained tree carries ordering down to `search_depth`; one more
+        // ply is the normal deepening step. A table with entries in it orders
+        // positions the tree no longer holds, so take the caller's word then.
+        let supported = if self.tt.stores > 0 {
+            requested
+        } else {
+            self.node.search_depth.saturating_add(1)
+        };
+        requested
+            .min(supported)
+            .min(self.options.max_depth.unwrap_or(u8::MAX))
+            .max(1)
+    }
+
     pub fn search(&mut self) -> SearchResult<M> {
         let start = std::time::Instant::now();
         let aim = NegamaxAim::from(self.node.gamestate.player_aim());
@@ -157,7 +198,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         // Check if iterative enabled
         if self.options.iterative {
             // Implement iterative deepening
-            let mut depth = 1;
+            let mut depth = self.start_depth();
             let mut result = None;
             loop {
                 match if self.options.alpha_beta {
@@ -167,7 +208,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             &mut self.node,
                             &mut self.evaluator,
                             depth,
-                            if depth > 1 { expiration } else { None },
+                            if result.is_some() { expiration } else { None },
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
@@ -180,7 +221,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             &mut self.node,
                             &mut self.evaluator,
                             depth,
-                            if depth > 1 { expiration } else { None },
+                            if result.is_some() { expiration } else { None },
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
@@ -287,9 +328,12 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         }
     }
 
-    /// Play the given move, advancing the tree down a node
-    pub fn play_move(&mut self, m: &M) {
-        self.node.advance(m);
+    /// Play the given move, advancing the tree down a node.
+    ///
+    /// Returns whether the subtree for that move existed and was kept; see
+    /// [`Node::advance`].
+    pub fn play_move(&mut self, m: &M) -> bool {
+        self.node.advance(m)
     }
 }
 
@@ -1023,5 +1067,81 @@ mod test {
             // assert_eq!(par_result.best, single_result.best);
             assert_eq!(par_result.value, single_result.value);
         }
+    }
+
+    /// The move played is not always one the search expanded: a time-limited
+    /// search can stop before it reaches every root move, and analysing a
+    /// recorded game plays the record's move rather than the search's. That
+    /// used to panic in `Node::advance`.
+    #[test]
+    fn play_move_rebuilds_when_move_was_not_expanded() {
+        let opts = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            max_depth: Some(3),
+            ..Default::default()
+        };
+        let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, opts);
+
+        // Nothing has been searched, so no child exists for this move.
+        assert!(!n.play_move(&TttMove::from(0)));
+        // The rebuilt node is still searchable.
+        let result = n.search();
+        assert!(result.nodes > 0);
+        // And a move the search did expand keeps its subtree.
+        assert!(n.play_move(&result.best));
+    }
+
+    /// `initial_depth` may skip the early deepening passes but must not
+    /// change the answer: at a fixed depth the value is the exact minimax
+    /// value whatever order the moves were searched in.
+    #[test]
+    fn initial_depth_does_not_change_the_answer() {
+        let base = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            pre_sort: true,
+            max_depth: Some(5),
+            ..Default::default()
+        };
+        let mut from_one = Negamax::new(Node::new(Ttt::default()), TttEvaluator, base);
+        let mut skipping = Negamax::new(
+            Node::new(Ttt::default()),
+            TttEvaluator,
+            SearchOptions { initial_depth: u8::MAX, ..base },
+        );
+
+        for _ in 0..5 {
+            let a = from_one.search();
+            let b = skipping.search();
+            assert_eq!(a.value, b.value);
+            assert!(b.depth <= 5, "start depth must respect max_depth");
+            // Same move into both, so the two stay on the same position.
+            from_one.play_move(&a.best);
+            skipping.play_move(&a.best);
+        }
+    }
+
+    /// A cold node has no ordering to skip ahead on, so the request is
+    /// clamped back to a normal start from depth 1.
+    #[test]
+    fn initial_depth_is_clamped_on_a_cold_node() {
+        let opts = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            max_depth: Some(4),
+            initial_depth: u8::MAX,
+            ..Default::default()
+        };
+        let n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, opts);
+        assert_eq!(n.start_depth(), 1);
+
+        // After a search the tree carries ordering, so one step past what it
+        // was searched to is allowed.
+        let mut n = n;
+        n.search();
+        n.play_move(&TttMove::from(0));
+        assert_eq!(n.start_depth(), (n.node.search_depth + 1).min(4));
+        assert!(n.start_depth() > 1);
     }
 }
