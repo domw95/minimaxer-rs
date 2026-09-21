@@ -9,12 +9,21 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use minimaxer::games::mancala::{Mancala, MancalaEvaluator};
 use minimaxer::games::tictactoe::{Ttt, TttEvaluator};
 use minimaxer::negamax::{negamax, Negamax, NegamaxAim, SearchOptions};
+use minimaxer::arena::Arena;
 use minimaxer::node::Node;
 
 /// Full-width tic-tac-toe, no pruning. The worst case.
 fn ttt_plain() {
-    let mut node = Node::new(Ttt::new(minimaxer::games::tictactoe::Player::One));
-    black_box(negamax(&mut node, &mut TttEvaluator, 9, NegamaxAim::Maximise));
+    let (mut arena, root) = Arena::with_root(Node::new(Ttt::new(
+        minimaxer::games::tictactoe::Player::One,
+    )));
+    black_box(negamax(
+        &mut arena,
+        root,
+        &mut TttEvaluator,
+        9,
+        NegamaxAim::Maximise,
+    ));
 }
 
 fn ttt_with(opts: SearchOptions) {

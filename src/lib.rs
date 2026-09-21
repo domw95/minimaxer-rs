@@ -1,4 +1,5 @@
 use std::{fmt::Debug, time::Duration};
+pub mod arena;
 pub mod games;
 pub mod negamax;
 pub mod tt;

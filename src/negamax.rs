@@ -8,8 +8,33 @@ use std::{
     time::Duration,
 };
 
+use crate::arena::{migrate, Arena, NodeId};
 use crate::tt::{Probe, Tt};
 use crate::{node::Node, Evaluate, Gamestate, Move, NodeAim, SearchExit, SearchResult};
+
+/// When to discard the parts of the tree a deepening pass no longer needs.
+///
+/// Between passes the tree holds two quite different things: the move ordering
+/// that makes alpha-beta cut off early, and the nodes that ordering was
+/// derived from. Only the first is needed by the next pass. Removal writes the
+/// ordering back into each node's move list and then throws the nodes away,
+/// which is what stops memory growing with the union of every pass rather than
+/// with the last one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalMethod {
+    /// Keep every node. The default, and the behaviour before removal existed.
+    #[default]
+    None,
+    /// Remove after every deepening pass.
+    Always,
+    /// Remove once the pass just finished was at least
+    /// [`SearchOptions::removal_depth`]. The early passes are small enough
+    /// that removing after them costs more in regenerated nodes than it saves.
+    Depth,
+    /// Remove once the tree holds at least [`SearchOptions::removal_count`]
+    /// nodes, which is the one that bounds memory directly.
+    Count,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NegamaxAim {
@@ -120,11 +145,21 @@ pub struct SearchOptions {
     /// alternatives, and widens `random_best`. Costs a lot of nodes when the
     /// evaluator produces many equal values.
     pub keep_equal_siblings: bool,
+    /// When to discard nodes between iterative deepening passes. See
+    /// [`RemovalMethod`]. Only applies when `iterative` is set.
+    pub removal: RemovalMethod,
+    /// Pass depth at or above which [`RemovalMethod::Depth`] removes.
+    pub removal_depth: u8,
+    /// Tree size at or above which [`RemovalMethod::Count`] removes.
+    pub removal_count: u32,
 }
 
 /// Negamax search with pruning and timeout
 pub struct Negamax<G, M, E> {
-    node: Node<G, M>,
+    /// Owns every node of the search tree. Re-rooting and node removal both
+    /// work by moving what is kept into a fresh arena and dropping this one.
+    arena: Arena<G, M>,
+    root: NodeId,
     evaluator: E,
     /// Options
     pub options: SearchOptions,
@@ -136,8 +171,10 @@ pub struct Negamax<G, M, E> {
 impl<G, M: Move, E> Negamax<G, M, E> {
     pub fn new(node: Node<G, M>, evaluator: E, options: SearchOptions) -> Self {
         let tt = Tt::new(options.tt_bits);
+        let (arena, root) = Arena::with_root(node);
         Negamax {
-            node,
+            arena,
+            root,
             evaluator,
             options,
             tt,
@@ -149,8 +186,31 @@ impl<G, M: Move, E> Negamax<G, M, E> {
         (self.tt.hits, self.tt.stores)
     }
 
+    /// The root of the search tree, for inspecting the result of a search.
+    pub fn root(&self) -> &Node<G, M> {
+        self.arena.get(self.root)
+    }
+
+    /// Nodes currently held in the tree. Not the number searched: removal
+    /// discards nodes a pass has finished with.
+    pub fn tree_size(&self) -> usize {
+        self.arena.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arena(&self) -> &Arena<G, M> {
+        &self.arena
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_id(&self) -> NodeId {
+        self.root
+    }
+
     pub fn replace_gamestate(&mut self, gamestate: G) {
-        self.node = Node::new(gamestate);
+        let (arena, root) = Arena::with_root(Node::new(gamestate));
+        self.arena = arena;
+        self.root = root;
     }
 }
 
@@ -159,11 +219,12 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     /// options. Falls back to the search's own choice.
     fn root_move(&self, aim: NegamaxAim) -> (M, f32) {
         if self.options.random_best || self.options.random_weight > 0.0 {
-            if let Some(chosen) = pick_root_move(&self.node, aim, &self.options) {
+            if let Some(chosen) = pick_root_move(&self.arena, self.root, aim, &self.options) {
                 return chosen;
             }
         }
-        (self.node.best.clone().unwrap(), self.node.value.unwrap())
+        let root = self.arena.get(self.root);
+        (root.best.clone().unwrap(), root.value.unwrap())
     }
 
     /// Depth for the first iterative deepening pass. See
@@ -179,7 +240,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
         let supported = if self.tt.stores > 0 {
             requested
         } else {
-            self.node.search_depth.saturating_add(1)
+            self.arena.get(self.root).search_depth.saturating_add(1)
         };
         requested
             .min(supported)
@@ -189,7 +250,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
 
     pub fn search(&mut self) -> SearchResult<M> {
         let start = std::time::Instant::now();
-        let aim = NegamaxAim::from(self.node.gamestate.player_aim());
+        let aim = NegamaxAim::from(self.arena.get(self.root).gamestate.player_aim());
         let expiration = self
             .options
             .max_time
@@ -205,7 +266,8 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     if self.options.parallel {
                         debug!("Running parallel negamax with depth {depth}");
                         negamax_ab_parallel(
-                            &mut self.node,
+                            &mut self.arena,
+                            self.root,
                             &mut self.evaluator,
                             depth,
                             if result.is_some() { expiration } else { None },
@@ -218,7 +280,8 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                     } else {
                         debug!("Running single threaded negamax with depth {depth}");
                         negamax_ab(
-                            &mut self.node,
+                            &mut self.arena,
+                            self.root,
                             &mut self.evaluator,
                             depth,
                             if result.is_some() { expiration } else { None },
@@ -230,7 +293,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                         )
                     }
                 } else {
-                    negamax(&mut self.node, &mut self.evaluator, depth, aim)
+                    negamax(&mut self.arena, self.root, &mut self.evaluator, depth, aim)
                 } {
                     SearchExit::Depth => {
                         // Store result and carry on to next depth
@@ -239,15 +302,21 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             best: root.0,
                             value: root.1,
                             exit: SearchExit::Depth,
-                            nodes: self.node.descendants,
-                            terminals: self.node.terminals,
+                            nodes: self.arena.get(self.root).descendants,
+                            terminals: self.arena.get(self.root).terminals,
                             time: start.elapsed(),
-                            depth: self.node.search_depth,
+                            depth: self.arena.get(self.root).search_depth,
                         });
                         // Stop once the requested depth has been completed,
                         // otherwise a search with no time limit never returns.
                         if self.options.max_depth.is_some_and(|max| depth >= max) {
                             return result.unwrap();
+                        }
+                        // Everything the next pass needs from this one is the
+                        // move ordering, which removal writes back into the
+                        // move lists before freeing the nodes it came from.
+                        if self.should_remove(depth) {
+                            self.remove_nodes();
                         }
                         depth += 1;
                     }
@@ -265,10 +334,10 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             best: root.0,
                             value: root.1,
                             exit: SearchExit::Exhaustive,
-                            nodes: self.node.descendants,
-                            terminals: self.node.terminals,
+                            nodes: self.arena.get(self.root).descendants,
+                            terminals: self.arena.get(self.root).terminals,
                             time: start.elapsed(),
-                            depth: self.node.search_depth,
+                            depth: self.arena.get(self.root).search_depth,
                         };
                     }
                     SearchExit::Terminal => {
@@ -283,7 +352,8 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             if self.options.parallel {
                 debug!("Running parallel negamax");
                 negamax_ab_parallel(
-                    &mut self.node,
+                    &mut self.arena,
+                    self.root,
                     &mut self.evaluator,
                     self.options.max_depth.unwrap_or(u8::MAX),
                     expiration,
@@ -296,7 +366,8 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             } else {
                 debug!("Running single threaded negamax");
                 negamax_ab(
-                    &mut self.node,
+                    &mut self.arena,
+                    self.root,
                     &mut self.evaluator,
                     self.options.max_depth.unwrap_or(u8::MAX),
                     expiration,
@@ -309,7 +380,8 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             }
         } else {
             negamax(
-                &mut self.node,
+                &mut self.arena,
+                self.root,
                 &mut self.evaluator,
                 self.options.max_depth.unwrap_or(u8::MAX),
                 aim,
@@ -321,33 +393,119 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             best: root.0,
             value: root.1,
             exit,
-            nodes: self.node.descendants,
-            terminals: self.node.terminals,
+            nodes: self.arena.get(self.root).descendants,
+            terminals: self.arena.get(self.root).terminals,
             time: start.elapsed(),
-            depth: self.node.search_depth,
+            depth: self.arena.get(self.root).search_depth,
         }
     }
 
-    /// Play the given move, advancing the tree down a node.
+    /// Whether the pass that just finished at `depth` should be followed by
+    /// node removal.
+    fn should_remove(&self, depth: u8) -> bool {
+        match self.options.removal {
+            RemovalMethod::None => false,
+            RemovalMethod::Always => true,
+            RemovalMethod::Depth => depth >= self.options.removal_depth,
+            RemovalMethod::Count => self.arena.len() as u64 >= self.options.removal_count as u64,
+        }
+    }
+
+    /// Collapse the tree to the principal variation plus one level of
+    /// siblings, keeping the move ordering.
     ///
-    /// Returns whether the subtree for that move existed and was kept; see
-    /// [`Node::advance`].
+    /// Two steps, and the order of them is the whole point. First each node
+    /// that is about to lose its children has them sorted and their moves
+    /// written back into its move list, so the ordering outlives the nodes
+    /// that produced it -- ordering is worth several times the search and must
+    /// not be thrown away with them. Then what is left is moved into a fresh
+    /// arena and the old one is dropped whole, which is what actually returns
+    /// the memory.
+    pub fn remove_nodes(&mut self) {
+        prune_to_best(
+            &mut self.arena,
+            self.root,
+            true,
+            self.options.prune_by_path_length,
+        );
+        let mut kept = Arena::new();
+        let root = migrate(&mut self.arena, &mut kept, self.root);
+        self.arena = kept;
+        self.root = root;
+    }
+
+    /// Play the given move, re-rooting the tree onto the subtree for that move
+    /// and dropping the rest.
+    ///
+    /// Returns whether an existing subtree was found and kept. A search that
+    /// ran out of time can stop before expanding every root move, and
+    /// analysing a recorded game plays the move from the record rather than
+    /// the one the search chose, so the move asked for may never have been
+    /// expanded. In that case the tree is rebuilt from the move instead, which
+    /// is the same position the caller would have got from a fresh node.
     pub fn play_move(&mut self, m: &M) -> bool {
-        self.node.advance(m)
+        let existing = self
+            .arena
+            .get(self.root)
+            .children
+            .iter()
+            .find(|(mov, _)| mov == m)
+            .map(|(_, id)| *id);
+        match existing {
+            Some(child) => {
+                let mut kept = Arena::new();
+                let root = migrate(&mut self.arena, &mut kept, child);
+                self.arena = kept;
+                self.root = root;
+                true
+            }
+            None => {
+                let rebuilt = self.arena.get(self.root).play_move(m);
+                let (arena, root) = Arena::with_root(rebuilt);
+                self.arena = arena;
+                self.root = root;
+                false
+            }
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Expand every move of `id` into a child node.
+///
+/// Needed by the parallel search, which cannot create children lazily from
+/// inside a rayon task, and by `sort_on_create`.
+fn create_all_children<G: Gamestate<M>, M: Move>(arena: &mut Arena<G, M>, id: NodeId) {
+    loop {
+        let Some(m) = arena.get_mut(id).moves.pop() else {
+            break;
+        };
+        let child = arena.get(id).play_move(&m);
+        let child = arena.alloc(child);
+        arena.get_mut(id).children.push((m, child));
+    }
+}
+
+/// What a rayon task reports back about the child it searched.
+#[derive(Debug, Clone)]
 struct ParallelResult<M> {
+    /// Index into the parent's children, so the parent can write the result
+    /// back without the task holding a reference into the arena.
+    index: usize,
     exit: SearchExit,
+    /// The child's value as the parent sees it.
     best: f32,
-    mov: M,
+    /// The child's own fields, to be copied back into the arena.
+    value: Option<f32>,
+    best_move: Option<M>,
+    search_depth: u8,
+    path_length: u8,
     descendants: u32,
     terminals: u32,
 }
 
 fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
-    node: &mut Node<G, M>,
+    arena: &mut Arena<G, M>,
+    id: NodeId,
     evaluator: &mut E,
     depth: u8,
     expiration: Option<std::time::Instant>,
@@ -365,6 +523,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // End of recursion. Checked before move generation: leaves are the bulk
         // of the tree and generating their moves only to discard them dominates
         // the search when the move generator allocates.
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
             node.path_length = 0;
@@ -373,8 +532,9 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             node.path_length = 1;
             SearchExit::Depth
         }
-    } else if node.get_moves() == 0 {
+    } else if arena.get_mut(id).get_moves() == 0 {
         // Game end condition, evaluate the gamestate
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         node.path_length = 0;
         SearchExit::Terminal
@@ -386,33 +546,52 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             }
         }
         // continue recursion
-        node.reset_stats();
+        arena.get_mut(id).reset_stats();
         // Go through each move and child in parallel using rayon
-        // Print node move state
-        node.create_all_children();
+        create_all_children(arena, id);
 
+        // Each task searches its child in an arena of its own.
+        //
+        // Disjoint `&mut` into one arena is not something the borrow checker
+        // will hand out, and a shared allocator would need a lock on the
+        // hottest operation in the search. The cost is that the subtrees the
+        // tasks build are dropped rather than kept for the next deepening
+        // pass, so parallel iterative deepening re-searches below the root.
+        // The root's children keep their values, so root ordering survives.
+        // The sequential search, which is what the deep work actually uses,
+        // keeps its whole tree.
         let alpha = AtomicF32::new(alpha);
-        let mut results = Vec::new();
-        let evaluators = node
+        let tasks: Vec<(usize, G, NegamaxAim, E)> = arena
+            .get(id)
             .children
-            .iter_mut()
-            .map(|child| evaluator.clone())
-            .collect::<Vec<_>>();
-        node.children
-            .par_iter_mut()
-            .zip(evaluators)
-            .map(|((m, child), mut evaluator)| {
+            .iter()
+            .enumerate()
+            .map(|(i, (_, child))| {
+                let child = arena.get(*child);
+                (
+                    i,
+                    child.gamestate.clone(),
+                    NegamaxAim::from(child.gamestate.player_aim()),
+                    evaluator.clone(),
+                )
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        tasks
+            .into_par_iter()
+            .map(|(index, gamestate, child_aim, mut evaluator)| {
                 // Only flip the window when the turn actually passes over.
-                let child_aim = NegamaxAim::from(child.gamestate.player_aim());
                 let a_now = alpha.load(Ordering::Relaxed);
                 let (c_aim, c_alpha, c_beta) = if child_aim == aim {
                     (aim, a_now, beta)
                 } else {
                     (-aim, -beta, -a_now)
                 };
-                // Recurse with child node and remember best
+                let (mut sub, sub_root) = Arena::with_root(Node::new(gamestate));
                 let exit = negamax_ab(
-                    child,
+                    &mut sub,
+                    sub_root,
                     &mut evaluator,
                     depth - 1,
                     expiration,
@@ -424,6 +603,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 );
 
                 // Get best out of current and child
+                let child = sub.get(sub_root);
                 let value = parent_view(child, aim);
 
                 // Raise alpha atomically; a load/store pair loses concurrent
@@ -432,9 +612,13 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
 
                 // Return result
                 let result = ParallelResult {
+                    index,
                     exit,
                     best: value,
-                    mov: m.clone(),
+                    value: child.value,
+                    best_move: child.best.clone(),
+                    search_depth: child.search_depth,
+                    path_length: child.path_length,
                     descendants: child.descendants + 1,
                     terminals: child.terminals + 1,
                 };
@@ -443,16 +627,35 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             })
             .collect_into_vec(&mut results);
 
+        // Copy each child's result back into the tree so the next deepening
+        // pass can order by it.
+        for r in &results {
+            let child = arena.get(id).children[r.index].1;
+            let child = arena.get_mut(child);
+            child.value = r.value;
+            child.best = r.best_move.clone();
+            child.search_depth = r.search_depth;
+            child.path_length = r.path_length;
+            child.descendants = r.descendants.saturating_sub(1);
+            child.terminals = r.terminals.saturating_sub(1);
+        }
+
         // Update node stats
         let mut best = (f32::NEG_INFINITY, None);
+        let mut descendants = 0;
+        let mut terminals = 0;
         for r in &results {
-            node.descendants += r.descendants;
-            node.terminals += r.terminals;
+            descendants += r.descendants;
+            terminals += r.terminals;
             if r.best > best.0 {
-                best = (r.best, Some(r.mov.clone()));
+                best = (r.best, Some(r.index));
             }
         }
-        node.best = Some(best.1.unwrap());
+        let best_move = best.1.map(|i| arena.get(id).children[i].0.clone());
+        let node = arena.get_mut(id);
+        node.descendants = descendants;
+        node.terminals = terminals;
+        node.best = Some(best_move.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
         // Return exit reason
@@ -473,12 +676,6 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     }
 }
 
-/// A child's value as the parent sees it.
-///
-/// Most games alternate turns, so the child's value is negated. Games that
-/// can grant a repeat turn (Kalah landing its last stone in its own store)
-/// produce children with the same player to move, and those must not be
-/// flipped.
 fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: NegamaxAim) -> f32 {
     match child.value {
         Some(v) => {
@@ -498,12 +695,21 @@ fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: Negamax
 /// deterministic engine replays the same game forever. That is poor value as
 /// a training opponent, hence the option to spread the choice over moves the
 /// search cannot separate.
+
+/// Re-pick the root move among equally good alternatives.
+///
+/// The search keeps the first move that beats the incumbent, so a
+/// deterministic engine replays the same game forever. That is poor value as
+/// a training opponent, hence the option to spread the choice over moves the
+/// search cannot separate.
 fn pick_root_move<G: Gamestate<M>, M: Move>(
-    node: &Node<G, M>,
+    arena: &Arena<G, M>,
+    id: NodeId,
     aim: NegamaxAim,
     opts: &SearchOptions,
 ) -> Option<(M, f32)> {
     use rand::Rng;
+    let node = arena.get(id);
     if node.children.is_empty() {
         return None;
     }
@@ -514,7 +720,7 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
         .children
         .iter()
         .find(|(m, _)| Some(m) == node.best.as_ref())
-        .map(|(_, c)| c.search_depth)?;
+        .map(|(_, c)| arena.get(*c).search_depth)?;
 
     let mut rng = rand::thread_rng();
 
@@ -522,7 +728,10 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
         let tied: Vec<&M> = node
             .children
             .iter()
-            .filter(|(_, c)| c.search_depth == best_depth && parent_view(c, aim) == best_value)
+            .filter(|(_, c)| {
+                let c = arena.get(*c);
+                c.search_depth == best_depth && parent_view(c, aim) == best_value
+            })
             .map(|(m, _)| m)
             .collect();
         if tied.is_empty() {
@@ -539,9 +748,9 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
         let weighted: Vec<(&M, f32, f32)> = node
             .children
             .iter()
-            .filter(|(_, c)| c.search_depth == best_depth)
+            .filter(|(_, c)| arena.get(*c).search_depth == best_depth)
             .map(|(m, c)| {
-                let v = parent_view(c, aim);
+                let v = parent_view(arena.get(*c), aim);
                 let w = opts
                     .random_weight
                     .powf(v - best_value)
@@ -573,11 +782,17 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
 /// result. Value breaks that tie, and path length breaks the value tie when
 /// `prune_by_path_length` is on.
 fn order_children<G: Gamestate<M>, M: Move>(
-    node: &mut Node<G, M>,
+    arena: &mut Arena<G, M>,
+    id: NodeId,
     aim: NegamaxAim,
     prune_by_path_length: bool,
 ) {
-    node.children.sort_by(|(_, a), (_, b)| {
+    // Taken out so the comparator can read the children's nodes out of the
+    // same arena the list lives in.
+    let mut children = std::mem::take(&mut arena.get_mut(id).children);
+    children.sort_by(|(_, a), (_, b)| {
+        let a = arena.get(*a);
+        let b = arena.get(*b);
         b.search_depth
             .cmp(&a.search_depth)
             .then_with(|| {
@@ -596,11 +811,97 @@ fn order_children<G: Gamestate<M>, M: Move>(
                 }
             })
     });
+    arena.get_mut(id).children = children;
+}
+
+/// The child of `id` at position `index`, creating it from the next unplayed
+/// move if it does not exist yet.
+///
+/// This is the index-based replacement for the old `ChildrenIter`: children
+/// are still generated lazily, so a node that alpha-beta cuts off early never
+/// pays for the moves it did not look at. A move popped here becomes
+/// `children[index]`, which is why `index` can be used to name the best move
+/// after the loop rather than cloning one per iteration.
+fn child_at<G: Gamestate<M>, M: Move>(
+    arena: &mut Arena<G, M>,
+    id: NodeId,
+    index: usize,
+) -> Option<NodeId> {
+    {
+        let node = arena.get(id);
+        if index < node.children.len() {
+            return Some(node.children[index].1);
+        }
+    }
+    let m = arena.get_mut(id).moves.pop()?;
+    let child = arena.get(id).play_move(&m);
+    let child = arena.alloc(child);
+    arena.get_mut(id).children.push((m, child));
+    Some(child)
+}
+
+/// Collapse the subtree at `id` to the principal variation plus one level of
+/// siblings, first writing the ordering it is about to lose into the move
+/// lists.
+///
+/// Ported from `removeNonBestNodes` in the TypeScript original. `keep` follows
+/// the principal variation: the node it is true at keeps all of its children,
+/// and passes it on only to the best of them. Everywhere else the node is
+/// reduced to its best child, and the moves of the children being discarded
+/// are appended to its move list in order so that the next pass regenerates
+/// them best-first.
+///
+/// This does not free anything by itself -- it decides what the following
+/// migration will keep.
+fn prune_to_best<G: Gamestate<M>, M: Move>(
+    arena: &mut Arena<G, M>,
+    id: NodeId,
+    keep: bool,
+    prune_by_path_length: bool,
+) {
+    if arena.get(id).children.is_empty() {
+        return;
+    }
+    // A node's aim is always that of the player to move in it: the search
+    // flips the window exactly when the turn passes over, so games with
+    // repeat turns stay consistent here without being special-cased.
+    let aim = NegamaxAim::from(arena.get(id).gamestate.player_aim());
+    order_children(arena, id, aim, prune_by_path_length);
+
+    if keep {
+        let count = arena.get(id).children.len();
+        for i in 0..count {
+            let child = arena.get(id).children[i].1;
+            prune_to_best(arena, child, i == 0, prune_by_path_length);
+        }
+        return;
+    }
+
+    let children = std::mem::take(&mut arena.get_mut(id).children);
+    let mut children = children.into_iter();
+    let best = children.next().expect("children checked non-empty");
+    // `moves` is popped from the back, so the discarded moves go on reversed:
+    // the next pass then plays them in the order this pass ranked them, after
+    // the best child which is already expanded. Any move never expanded at all
+    // stays in front of them and so is tried last, as before.
+    let mut discarded: Vec<M> = children.map(|(m, _)| m).collect();
+    discarded.reverse();
+    let node = arena.get_mut(id);
+    node.moves.append(&mut discarded);
+    debug_assert_ne!(
+        node.moves.capacity(),
+        0,
+        "an emptied move list with no capacity would be regenerated, \
+         duplicating the child that was kept"
+    );
+    node.children.push(best.clone());
+    prune_to_best(arena, best.1, false, prune_by_path_length);
 }
 
 /// Negamax search, no pruning or timeout
 pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
-    node: &mut Node<G, M>,
+    arena: &mut Arena<G, M>,
+    id: NodeId,
     evaluator: &mut E,
     depth: u8,
     aim: NegamaxAim,
@@ -609,6 +910,7 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // End of recursion. Checked before move generation: leaves are the bulk
         // of the tree and generating their moves only to discard them dominates
         // the search when the move generator allocates.
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
             node.path_length = 0;
@@ -617,26 +919,28 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             node.path_length = 1;
             SearchExit::Depth
         }
-    } else if node.get_moves() == 0 {
+    } else if arena.get_mut(id).get_moves() == 0 {
         // Game end condition, evaluate the gamestate
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         node.path_length = 0;
         SearchExit::Terminal
     } else {
         // continue recursion
-        node.reset_stats();
-        // track best value and move
+        arena.get_mut(id).reset_stats();
+        // track best value and the index of the child it came from
         let mut best = (f32::NEG_INFINITY, None);
         // Assume exhaustive first, any time or depth will override
         let mut exit = SearchExit::Exhaustive;
-        // Go through each move and child (iterator creates children on the fly)
+        // Go through each move and child (children are created on the fly)
         let mut descendants = 0;
         let mut terminals = 0;
-        for (m, child) in node.into_iter() {
+        let mut index = 0;
+        while let Some(child) = child_at(arena, id, index) {
             // Clone gamestate to make child
             // Recurse with child node and remember best
-            let child_aim = NegamaxAim::from(child.gamestate.player_aim());
-            match negamax(child, evaluator, depth - 1, child_aim) {
+            let child_aim = NegamaxAim::from(arena.get(child).gamestate.player_aim());
+            match negamax(arena, child, evaluator, depth - 1, child_aim) {
                 SearchExit::Depth => {
                     exit = SearchExit::Depth;
                 }
@@ -650,18 +954,21 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 SearchExit::Exhaustive => {}
             };
             // Get best out of current and child
+            let child = arena.get(child);
             let value = parent_view(child, aim);
             if value > best.0 {
-                best = (value, Some(m.clone()));
+                best = (value, Some(index));
             }
             // Update parent node details
             descendants += child.descendants + 1;
             terminals += child.terminals;
-            // Update parent node with child node
+            index += 1;
         }
+        let best_move = best.1.map(|i| arena.get(id).children[i].0.clone());
+        let node = arena.get_mut(id);
         node.descendants = descendants;
         node.terminals = terminals;
-        node.best = Some(best.1.unwrap());
+        node.best = Some(best_move.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
         exit
@@ -669,8 +976,10 @@ pub fn negamax<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
 }
 
 /// Negamax search, with alpha-beta pruning
+#[allow(clippy::too_many_arguments)]
 pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
-    node: &mut Node<G, M>,
+    arena: &mut Arena<G, M>,
+    id: NodeId,
     evaluator: &mut E,
     depth: u8,
     expiration: Option<std::time::Instant>,
@@ -684,6 +993,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // End of recursion. Checked before move generation: leaves are the bulk
         // of the tree and generating their moves only to discard them dominates
         // the search when the move generator allocates.
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         if node.gamestate.is_terminal() {
             node.path_length = 0;
@@ -692,8 +1002,9 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             node.path_length = 1;
             SearchExit::Depth
         }
-    } else if node.get_moves() == 0 {
+    } else if arena.get_mut(id).get_moves() == 0 {
         // Game end condition, evaluate the gamestate
+        let node = arena.get_mut(id);
         node.evaluate(evaluator, aim.into());
         node.path_length = 0;
         SearchExit::Terminal
@@ -706,12 +1017,17 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         }
         // Ask the table before doing any work: this position may already have
         // been searched down a different move order.
-        let key = if tt.enabled() { node.gamestate.position_key() } else { 0 };
+        let key = if tt.enabled() {
+            arena.get(id).gamestate.position_key()
+        } else {
+            0
+        };
         let alpha_orig = alpha;
         let mut tt_best: Option<M> = None;
         if key != 0 {
             match tt.lookup(key, depth, alpha, beta) {
                 Probe::Cutoff(value, m) => {
+                    let node = arena.get_mut(id);
                     node.value = Some(value);
                     node.best = Some(m);
                     node.search_depth = depth;
@@ -733,11 +1049,12 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         }
 
         // continue recursion
-        node.reset_stats();
+        arena.get_mut(id).reset_stats();
         // A move that was best for this position elsewhere in the tree is the
-        // best guess here too. ChildrenIter pops from the back, so moving it
+        // best guess here too. Moves are popped from the back, so moving it
         // last gets it searched first.
         if let Some(m) = &tt_best {
+            let node = arena.get_mut(id);
             if node.children.is_empty() && !node.moves.is_empty() {
                 if let Some(i) = node.moves.iter().position(|x| x == m) {
                     let last = node.moves.len() - 1;
@@ -749,20 +1066,24 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         // A child stores its value from its own perspective and the parent
         // negates it, so ascending child value puts this node's best move
         // first, which is what makes alpha-beta cut off early.
-        if opts.sort_on_create && node.children.is_empty() && depth >= opts.sort_on_create_min_depth
+        if opts.sort_on_create
+            && arena.get(id).children.is_empty()
+            && depth >= opts.sort_on_create_min_depth
         {
             // First visit: nothing has an inherited value yet, so fall back to
             // each child's own static evaluation rather than move order.
-            node.create_all_children();
-            for (_, child) in node.children.iter_mut() {
-                let child_aim = NegamaxAim::from(child.gamestate.player_aim());
-                child.evaluate(evaluator, child_aim.into());
+            create_all_children(arena, id);
+            let count = arena.get(id).children.len();
+            for i in 0..count {
+                let child = arena.get(id).children[i].1;
+                let child_aim = NegamaxAim::from(arena.get(child).gamestate.player_aim());
+                arena.get_mut(child).evaluate(evaluator, child_aim.into());
             }
-            order_children(node, aim, opts.prune_by_path_length);
-        } else if opts.pre_sort && !node.children.is_empty() {
-            order_children(node, aim, opts.prune_by_path_length);
+            order_children(arena, id, aim, opts.prune_by_path_length);
+        } else if opts.pre_sort && !arena.get(id).children.is_empty() {
+            order_children(arena, id, aim, opts.prune_by_path_length);
         }
-        // track best value and move
+        // track best value and the index of the child it came from
         let mut best = (f32::NEG_INFINITY, None);
         let mut best_path: u8 = 0;
         // Assume exhaustive first, any time or depth will override
@@ -770,18 +1091,20 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
 
         let mut descendants = 0;
         let mut terminals = 0;
+        let mut index = 0;
         // Go through each move and child
-        for (m, child) in node.into_iter() {
-            trace!("Exploring move {m:?} at depth {depth}");
+        while let Some(child) = child_at(arena, id, index) {
+            trace!("Exploring child {index} at depth {depth}");
             // Recurse with child node and remember best
             // Only flip the window when the turn actually passes over.
-            let child_aim = NegamaxAim::from(child.gamestate.player_aim());
+            let child_aim = NegamaxAim::from(arena.get(child).gamestate.player_aim());
             let (c_aim, c_alpha, c_beta) = if child_aim == aim {
                 (aim, alpha, beta)
             } else {
                 (-aim, -beta, -alpha)
             };
             match negamax_ab(
+                arena,
                 child,
                 evaluator,
                 depth - 1,
@@ -806,9 +1129,10 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
             };
 
             // Get best out of current and child
+            let child = arena.get(child);
             let value = parent_view(child, aim);
             if value > best.0 {
-                best = (value, Some(m.clone()));
+                best = (value, Some(index));
                 best_path = child.path_length;
             } else if opts.prune_by_path_length && value == best.0 && best.1.is_some() {
                 // Same value: take the quicker win, or the slower loss.
@@ -818,13 +1142,14 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     child.path_length > best_path
                 };
                 if better {
-                    best = (value, Some(m.clone()));
+                    best = (value, Some(index));
                     best_path = child.path_length;
                 }
             }
             // Update parent node details
             descendants += child.descendants + 1;
             terminals += child.terminals;
+            index += 1;
 
             // check a/b
             alpha = alpha.max(value);
@@ -838,14 +1163,17 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                 break;
             }
         }
+        let best_move = best.1.map(|i| arena.get(id).children[i].0.clone());
+        let node = arena.get_mut(id);
         node.descendants = descendants;
         node.terminals = terminals;
-        node.best = Some(best.1.unwrap());
+        node.best = Some(best_move.unwrap());
         node.value = Some(best.0);
         node.search_depth = depth;
         node.path_length = best_path.saturating_add(1);
         if key != 0 {
-            tt.record(key, depth, best.0, alpha_orig, beta, node.best.clone());
+            let best_move = node.best.clone();
+            tt.record(key, depth, best.0, alpha_orig, beta, best_move);
         }
         exit
     }
@@ -855,7 +1183,8 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
 mod test {
     use std::result;
 
-    use super::{negamax, Negamax};
+    use super::{negamax, Negamax, RemovalMethod};
+    use crate::arena::Arena;
     use crate::tt::Tt;
     use crate::{
         games::tictactoe::{Ttt, TttEvaluator, TttMove},
@@ -876,52 +1205,52 @@ mod test {
         // Create a game
         let ttt = Ttt::new(crate::games::tictactoe::Player::One);
         // Create node
-        let mut node = Node::new(ttt);
+        let (mut arena, root) = Arena::with_root(Node::new(ttt));
         // Create evaluator
         let mut evaluator = crate::games::tictactoe::TttEvaluator;
         // Run search
         assert_eq!(
-            negamax(&mut node, &mut evaluator, 9, NegamaxAim::Maximise),
+            negamax(&mut arena, root, &mut evaluator, 9, NegamaxAim::Maximise),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(8)));
-        assert_eq!(node.terminals, 255168);
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).terminals, 255168);
 
         // player 2
         let ttt = Ttt::new(crate::games::tictactoe::Player::Two);
         // Create node
-        let mut node = Node::new(ttt);
+        let (mut arena, root) = Arena::with_root(Node::new(ttt));
         // Create evaluator
         let mut evaluator = crate::games::tictactoe::TttEvaluator;
         // Run search
         assert_eq!(
-            negamax(&mut node, &mut evaluator, 9, NegamaxAim::Minimise),
+            negamax(&mut arena, root, &mut evaluator, 9, NegamaxAim::Minimise),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(8)));
-        assert_eq!(node.terminals, 255168);
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).terminals, 255168);
 
         //  Repeated calls
         let ttt = Ttt::new(crate::games::tictactoe::Player::One);
-        let mut node = Node::new(ttt);
+        let (mut arena, root) = Arena::with_root(Node::new(ttt));
         assert_eq!(
-            negamax(&mut node, &mut evaluator, 2, NegamaxAim::Maximise),
+            negamax(&mut arena, root, &mut evaluator, 2, NegamaxAim::Maximise),
             crate::SearchExit::Depth
         );
-        assert_eq!(node.best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
         assert_eq!(
-            negamax(&mut node, &mut evaluator, 6, NegamaxAim::Maximise),
+            negamax(&mut arena, root, &mut evaluator, 6, NegamaxAim::Maximise),
             crate::SearchExit::Depth
         );
-        assert_eq!(node.best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
         assert_eq!(
-            negamax(&mut node, &mut evaluator, 9, NegamaxAim::Maximise),
+            negamax(&mut arena, root, &mut evaluator, 9, NegamaxAim::Maximise),
             crate::SearchExit::Exhaustive
         );
-        dbg!(node.children.len());
-        dbg!(node.descendants);
-        assert_eq!(node.best, Some(TttMove::from(8)));
-        assert_eq!(node.terminals, 255168);
+        dbg!(arena.get(root).children.len());
+        dbg!(arena.get(root).descendants);
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).terminals, 255168);
     }
 
     #[test]
@@ -943,13 +1272,14 @@ mod test {
         // Create a game
         let ttt = Ttt::new(crate::games::tictactoe::Player::One);
         // Create node
-        let mut node = Node::new(ttt);
+        let (mut arena, root) = Arena::with_root(Node::new(ttt));
         // Create evaluator
         let mut evaluator = crate::games::tictactoe::TttEvaluator;
         // Run search
         assert_eq!(
             negamax_ab(
-                &mut node,
+                &mut arena,
+                root,
                 &mut evaluator,
                 9,
                 None,
@@ -961,7 +1291,7 @@ mod test {
             ),
             crate::SearchExit::Exhaustive
         );
-        assert_eq!(node.best, Some(TttMove::from(8)));
+        assert_eq!(arena.get(root).best, Some(TttMove::from(8)));
         // assert_eq!(node.terminals, 255168);
 
         let mut n = Negamax::new(Node::new(Ttt::default()), TttEvaluator, Default::default());
@@ -1037,7 +1367,7 @@ mod test {
     #[test]
     fn ttt_parallel() {
         // Make sure that parallel and single threaded deliver the same results for each depth
-        let mut ttt = Ttt::new(crate::games::tictactoe::Player::One);
+        let ttt = Ttt::new(crate::games::tictactoe::Player::One);
         for depth in 1..10 {
             let mut par = Negamax::new(
                 Node::new(ttt.clone()),
@@ -1141,7 +1471,172 @@ mod test {
         let mut n = n;
         n.search();
         n.play_move(&TttMove::from(0));
-        assert_eq!(n.start_depth(), (n.node.search_depth + 1).min(4));
+        assert_eq!(n.start_depth(), (n.root().search_depth + 1).min(4));
         assert!(n.start_depth() > 1);
+    }
+
+    /// Removal must not change what the search returns.
+    ///
+    /// At a fixed depth alpha-beta from a full window gives the exact minimax
+    /// value whatever order the moves were tried in, so discarding nodes --
+    /// which only changes the order the next pass regenerates them in -- has
+    /// to leave the value alone. Mancala is the interesting case: it grants
+    /// repeat turns, so the player to move does not alternate and removal has
+    /// to take each node's aim from its own gamestate.
+    #[test]
+    fn removal_does_not_change_the_value() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        for depth in 1..=9u8 {
+            let base = SearchOptions {
+                alpha_beta: true,
+                iterative: true,
+                pre_sort: true,
+                max_depth: Some(depth),
+                ..Default::default()
+            };
+            let kept = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, base)
+                .search();
+            let removed = Negamax::new(
+                Node::new(Mancala::new()),
+                MancalaEvaluator,
+                SearchOptions { removal: RemovalMethod::Always, ..base },
+            )
+            .search();
+            assert_eq!(
+                kept.value, removed.value,
+                "removal changed the value at depth {depth}"
+            );
+            assert_eq!(kept.exit, removed.exit, "removal changed the exit at depth {depth}");
+        }
+
+        for depth in 1..=7u8 {
+            let base = SearchOptions {
+                alpha_beta: true,
+                iterative: true,
+                pre_sort: true,
+                max_depth: Some(depth),
+                ..Default::default()
+            };
+            let kept = Negamax::new(Node::new(Ttt::default()), TttEvaluator, base).search();
+            let removed = Negamax::new(
+                Node::new(Ttt::default()),
+                TttEvaluator,
+                SearchOptions { removal: RemovalMethod::Always, ..base },
+            )
+            .search();
+            assert_eq!(kept.value, removed.value, "removal changed the value at depth {depth}");
+        }
+    }
+
+    /// The point of removal: the tree left standing between passes is a
+    /// fraction of the one that was searched.
+    #[test]
+    fn removal_shrinks_the_tree() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let base = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            pre_sort: true,
+            max_depth: Some(9),
+            ..Default::default()
+        };
+        let mut n = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, base);
+        n.search();
+        let searched = n.tree_size();
+        n.remove_nodes();
+        let kept = n.tree_size();
+        assert!(
+            kept * 4 < searched,
+            "removal kept {kept} of {searched} nodes, which is not a saving"
+        );
+        assert!(kept > 1, "removal kept only the root, so the ordering is gone too");
+    }
+
+    /// Ordering is worth several times the search, so it has to survive the
+    /// nodes it was derived from. With removal on, the pass after a removal
+    /// should still be cutting off like an ordered search: compare against the
+    /// same search with no ordering at all, which is the cost of losing it.
+    #[test]
+    fn removal_keeps_the_move_ordering() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let opts = SearchOptions {
+            alpha_beta: true,
+            iterative: true,
+            max_depth: Some(11),
+            ..Default::default()
+        };
+        let ordered = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions { pre_sort: true, ..opts },
+        )
+        .search();
+        let unordered = Negamax::new(Node::new(Mancala::new()), MancalaEvaluator, opts).search();
+        let removed = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions { pre_sort: true, removal: RemovalMethod::Always, ..opts },
+        )
+        .search();
+
+        assert_eq!(removed.value, ordered.value);
+        // Regenerating discarded subtrees costs nodes, so this is not free,
+        // but it must stay far closer to the ordered search than to the
+        // unordered one.
+        assert!(
+            (removed.nodes as f64) < (ordered.nodes as f64 + unordered.nodes as f64) / 2.0,
+            "removal searched {} nodes; ordered {}, unordered {} -- ordering looks lost",
+            removed.nodes,
+            ordered.nodes,
+            unordered.nodes
+        );
+    }
+
+    /// Handing moves back to a node that already has a child is the part of
+    /// removal that can go quietly wrong: if the move list is regenerated
+    /// rather than appended to, the kept child gets expanded a second time and
+    /// the tree silently doubles up. Walk the tree and check no node lists the
+    /// same move twice.
+    #[test]
+    fn removal_does_not_duplicate_children() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+
+        let mut n = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions {
+                alpha_beta: true,
+                iterative: true,
+                pre_sort: true,
+                max_depth: Some(9),
+                removal: RemovalMethod::Always,
+                ..Default::default()
+            },
+        );
+        n.search();
+
+        let mut stack = vec![n.root_id()];
+        let mut checked = 0;
+        while let Some(id) = stack.pop() {
+            let node = n.arena().get(id);
+            for i in 0..node.children.len() {
+                for j in (i + 1)..node.children.len() {
+                    assert_ne!(
+                        node.children[i].0, node.children[j].0,
+                        "move expanded twice under one node"
+                    );
+                }
+                assert!(
+                    !node.moves.contains(&node.children[i].0),
+                    "a move that was already expanded is queued to be played again"
+                );
+                stack.push(node.children[i].1);
+            }
+            checked += 1;
+        }
+        assert!(checked > 1);
     }
 }
