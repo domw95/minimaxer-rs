@@ -1086,7 +1086,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         let mut tt_best: Option<M> = None;
         if key != 0 {
             match tt.lookup(key, depth, alpha, beta) {
-                Probe::Cutoff(value, m) => {
+                Probe::Cutoff(value, m, was_exhaustive) => {
                     let node = arena.get_mut(id);
                     node.value = Some(value);
                     node.best = Some(m);
@@ -1094,10 +1094,16 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
                     node.descendants = 0;
                     node.terminals = 0;
                     node.path_length = 1;
-                    // Deliberately not Exhaustive: a stored value says nothing
-                    // about whether that subtree reached its leaves, and
-                    // claiming otherwise would stop deepening early.
-                    return SearchExit::Depth;
+                    // Report exhaustive only when the stored search actually
+                    // was. Returning Depth unconditionally here meant a single
+                    // table hit anywhere stopped the whole search ever
+                    // reporting Exhaustive, so callers looking for exactly
+                    // solved positions silently got none.
+                    return if was_exhaustive {
+                        SearchExit::Exhaustive
+                    } else {
+                        SearchExit::Depth
+                    };
                 }
                 Probe::Hint { alpha: a, beta: b, best } => {
                     alpha = a;
@@ -1234,7 +1240,15 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
         node.path_length = best_path.saturating_add(1);
         if key != 0 {
             let best_move = node.best.clone();
-            tt.record(key, depth, best.0, alpha_orig, beta, best_move);
+            tt.record(
+                key,
+                depth,
+                best.0,
+                alpha_orig,
+                beta,
+                best_move,
+                exit == SearchExit::Exhaustive,
+            );
         }
         if opts.retain_depth != 0 && ply >= opts.retain_depth {
             collapse_children(arena, id, aim, opts, ply);

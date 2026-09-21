@@ -25,6 +25,15 @@ struct Entry<M> {
     depth: u8,
     bound: Bound,
     best: Option<M>,
+    /// Whether the search that produced this value reached the game's end down
+    /// every line, rather than stopping at its depth limit.
+    ///
+    /// Without this a table hit could never be reported as exhaustive, since a
+    /// stored value alone says nothing about how it was obtained. That makes a
+    /// single hit anywhere in the tree enough to stop the whole search ever
+    /// reporting `Exhaustive` — so a caller looking for exactly solved
+    /// positions silently gets none of them.
+    exhaustive: bool,
 }
 
 /// Fixed-size, direct-mapped, depth-preferred replacement.
@@ -70,7 +79,15 @@ impl<M: Move> Tt<M> {
         }
     }
 
-    fn store(&mut self, key: u64, depth: u8, value: f32, bound: Bound, best: Option<M>) {
+    fn store(
+        &mut self,
+        key: u64,
+        depth: u8,
+        value: f32,
+        bound: Bound,
+        best: Option<M>,
+        exhaustive: bool,
+    ) {
         if self.entries.is_empty() || key == 0 {
             return;
         }
@@ -83,7 +100,7 @@ impl<M: Move> Tt<M> {
         };
         if replace {
             self.stores += 1;
-            self.entries[slot] = Some(Entry { key, value, depth, bound, best });
+            self.entries[slot] = Some(Entry { key, value, depth, bound, best, exhaustive });
         }
     }
 }
@@ -92,8 +109,9 @@ impl<M: Move> Tt<M> {
 pub(crate) enum Probe<M> {
     /// Nothing usable.
     Miss,
-    /// Deep enough and conclusive: this is the answer.
-    Cutoff(f32, M),
+    /// Deep enough and conclusive: this is the answer. The flag carries
+    /// whether the stored search reached the game's end down every line.
+    Cutoff(f32, M, bool),
     /// Not conclusive, but narrows the window and/or suggests a move.
     Hint {
         alpha: f32,
@@ -105,9 +123,9 @@ pub(crate) enum Probe<M> {
 impl<M: Move> Tt<M> {
     pub(crate) fn lookup(&mut self, key: u64, depth: u8, alpha: f32, beta: f32) -> Probe<M> {
         // Copy out what we need so the borrow ends before the hit counter.
-        let Some((e_value, e_depth, e_bound, best)) = self
+        let Some((e_value, e_depth, e_bound, best, e_exhaustive)) = self
             .probe(key)
-            .map(|e| (e.value, e.depth, e.bound, e.best.clone()))
+            .map(|e| (e.value, e.depth, e.bound, e.best.clone(), e.exhaustive))
         else {
             return Probe::Miss;
         };
@@ -119,7 +137,7 @@ impl<M: Move> Tt<M> {
                 Bound::Exact => {
                     if let Some(m) = best.clone() {
                         self.hits += 1;
-                        return Probe::Cutoff(e_value, m);
+                        return Probe::Cutoff(e_value, m, e_exhaustive);
                     }
                 }
                 Bound::Lower => a = a.max(e_value),
@@ -128,7 +146,7 @@ impl<M: Move> Tt<M> {
             if a >= b {
                 if let Some(m) = best.clone() {
                     self.hits += 1;
-                    return Probe::Cutoff(e_value, m);
+                    return Probe::Cutoff(e_value, m, e_exhaustive);
                 }
             }
             return Probe::Hint { alpha: a, beta: b, best };
@@ -146,6 +164,7 @@ impl<M: Move> Tt<M> {
         alpha_orig: f32,
         beta: f32,
         best: Option<M>,
+        exhaustive: bool,
     ) {
         let bound = if value <= alpha_orig {
             Bound::Upper
@@ -154,6 +173,6 @@ impl<M: Move> Tt<M> {
         } else {
             Bound::Exact
         };
-        self.store(key, depth, value, bound, best);
+        self.store(key, depth, value, bound, best, exhaustive);
     }
 }
