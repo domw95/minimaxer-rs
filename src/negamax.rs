@@ -241,6 +241,33 @@ impl<G, M: Move, E> Negamax<G, M, E> {
         self.arena.get(self.root)
     }
 
+    /// The line the search expects to be played, best move first.
+    ///
+    /// Each node keeps the move it settled on, so the line is a walk from the
+    /// root following those. It is the most direct answer to what the engine
+    /// thinks, and worth more to someone watching than any single number:
+    /// the depth says how far it looked, this says what it saw.
+    ///
+    /// Shorter than the reported depth wherever the line runs into a node the
+    /// tree no longer holds. `retain_depth` and node removal both drop
+    /// subtrees once their ordering has been written back, so a bounded tree
+    /// can name its first few moves and no more. That is a real limit of the
+    /// answer rather than an error, so the walk stops rather than guessing.
+    pub fn principal_variation(&self) -> Vec<M> {
+        let mut line = Vec::new();
+        let mut id = self.root;
+        loop {
+            let node = self.arena.get(id);
+            let Some(best) = node.best.as_ref() else { break };
+            line.push(best.clone());
+            match node.children.iter().find(|(m, _)| m == best) {
+                Some((_, child)) => id = *child,
+                None => break,
+            }
+        }
+        line
+    }
+
     /// Nodes currently held in the tree. Not the number searched: removal
     /// discards nodes a pass has finished with.
     pub fn tree_size(&self) -> usize {
