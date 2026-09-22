@@ -312,6 +312,14 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
             // Implement iterative deepening
             let mut depth = self.start_depth();
             let mut result = None;
+            // A pass may only be cut short when there is already an answer to
+            // fall back on. Within one call that means after the first pass --
+            // but a retained tree that a previous call already searched
+            // carries one too, and without counting that, the first pass of
+            // every call runs unbounded however deep it has resumed to. A
+            // host pondering in slices then cannot bound its response time,
+            // which is the whole point of slicing.
+            let resumed_with_answer = self.arena.get(self.root).best.is_some();
             loop {
                 match if self.options.alpha_beta {
                     if self.options.parallel {
@@ -321,7 +329,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             self.root,
                             &mut self.evaluator,
                             depth,
-                            if result.is_some() { expiration } else { None },
+                            if result.is_some() || resumed_with_answer { expiration } else { None },
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
@@ -336,7 +344,7 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                             self.root,
                             &mut self.evaluator,
                             depth,
-                            if result.is_some() { expiration } else { None },
+                            if result.is_some() || resumed_with_answer { expiration } else { None },
                             aim,
                             f32::NEG_INFINITY,
                             f32::INFINITY,
@@ -374,8 +382,26 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
                         depth += 1;
                     }
                     SearchExit::Time => {
-                        // This depth failed, return previous depth result
-                        let mut result = result.unwrap();
+                        // This depth failed, so report the last one that did
+                        // finish. Within this call that is `result` -- but on
+                        // a resumed search the answer may instead be the one
+                        // the retained tree already carried, which is what
+                        // licensed cutting this pass short to begin with.
+                        let mut result = match result {
+                            Some(r) => r,
+                            None => {
+                                let root = self.root_move(aim);
+                                SearchResult {
+                                    best: root.0,
+                                    value: root.1,
+                                    exit: SearchExit::Time,
+                                    nodes: self.arena.get(self.root).descendants,
+                                    terminals: self.arena.get(self.root).terminals,
+                                    time: start.elapsed(),
+                                    depth: self.arena.get(self.root).search_depth,
+                                }
+                            }
+                        };
                         result.exit = SearchExit::Time;
                         result.time = start.elapsed();
                         return result;
@@ -1912,5 +1938,61 @@ mod test {
             full.play_move(&a.best);
             bounded.play_move(&b.best);
         }
+    }
+    /// A resumed search must honour `max_time` on its first pass.
+    ///
+    /// The guard that keeps a pass unbounded until there is something to
+    /// return used to consider only results from the current call, so every
+    /// `search()` on a tree a previous call had already searched ran one pass
+    /// to completion however deep it resumed to. A host pondering in slices
+    /// could not bound its response time -- measured at 4.2 seconds against a
+    /// 1 second deadline -- and once the pass could be cut short, the arm that
+    /// reports the previous depth panicked on an `unwrap`, because the answer
+    /// it wanted was in the retained tree rather than in this call.
+    ///
+    /// Asserted on depth rather than on the clock, so the test says the same
+    /// thing on a loaded machine as on an idle one: with a budget of nothing,
+    /// a resumed call must complete no pass at all.
+    #[test]
+    fn resumed_search_honours_max_time() {
+        use crate::games::mancala::{Mancala, MancalaEvaluator};
+        use std::time::Duration;
+
+        const WARM: u8 = 4;
+
+        let mut n = Negamax::new(
+            Node::new(Mancala::new()),
+            MancalaEvaluator,
+            SearchOptions {
+                alpha_beta: true,
+                iterative: true,
+                pre_sort: true,
+                max_depth: Some(WARM),
+                ..Default::default()
+            },
+        );
+
+        // Build a tree, unhurried. This is the answer a later call may fall
+        // back on.
+        let warm = n.search();
+        assert_eq!(warm.depth, WARM, "the warm-up should reach its depth cap");
+
+        // Now resume with no time to spend. Nothing can complete, so the only
+        // correct answer is the one the tree already held.
+        n.options.max_depth = None;
+        n.options.initial_depth = u8::MAX;
+        n.options.max_time = Some(Duration::ZERO);
+
+        let resumed = n.search();
+        assert_eq!(
+            resumed.exit,
+            crate::SearchExit::Time,
+            "a resumed pass with no budget must report Time"
+        );
+        assert_eq!(
+            resumed.depth, WARM,
+            "a resumed pass ran to completion despite having no budget"
+        );
+        assert_eq!(resumed.best, warm.best, "the fallback lost the retained answer");
     }
 }
