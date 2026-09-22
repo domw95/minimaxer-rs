@@ -4,6 +4,7 @@ pub mod games;
 pub mod negamax;
 pub mod tt;
 pub mod node;
+pub mod time;
 
 /// Reason for finishing search
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

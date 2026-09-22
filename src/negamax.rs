@@ -1,6 +1,8 @@
-use atomic_float::{AtomicF32, AtomicF64};
+#[cfg(feature = "parallel")]
+use atomic_float::AtomicF32;
 use core::panic;
 use log::{debug, trace};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::{
     ops::{Mul, Neg},
@@ -300,12 +302,12 @@ impl<G: Gamestate<M>, M: Move, E: Evaluate<G>> Negamax<G, M, E> {
     }
 
     pub fn search(&mut self) -> SearchResult<M> {
-        let start = std::time::Instant::now();
+        let start = crate::time::Instant::now();
         let aim = NegamaxAim::from(self.arena.get(self.root).gamestate.player_aim());
         let expiration = self
             .options
             .max_time
-            .map(|duration| std::time::Instant::now() + duration);
+            .map(|duration| crate::time::Instant::now() + duration);
 
         // Check if iterative enabled
         if self.options.iterative {
@@ -584,13 +586,35 @@ struct ParallelResult<M> {
     terminals: u32,
 }
 
+/// Without the `parallel` feature there is no thread pool to fan out to --
+/// wasm has no threads unless the host opts into shared memory -- so the
+/// option falls back to the sequential search rather than failing to build.
+#[cfg(not(feature = "parallel"))]
 #[allow(clippy::too_many_arguments)]
 fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     arena: &mut Arena<G, M>,
     id: NodeId,
     evaluator: &mut E,
     depth: u8,
-    expiration: Option<std::time::Instant>,
+    expiration: Option<crate::time::Instant>,
+    aim: NegamaxAim,
+    alpha: f32,
+    beta: f32,
+    opts: SearchOptions,
+    tt: &mut Tt<M>,
+    ply: u8,
+) -> SearchExit {
+    negamax_ab(arena, id, evaluator, depth, expiration, aim, alpha, beta, opts, tt, ply)
+}
+
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
+    arena: &mut Arena<G, M>,
+    id: NodeId,
+    evaluator: &mut E,
+    depth: u8,
+    expiration: Option<crate::time::Instant>,
     aim: NegamaxAim,
     alpha: f32,
     beta: f32,
@@ -625,7 +649,7 @@ fn negamax_ab_parallel<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     } else {
         // Check expiration
         if let Some(expire) = expiration {
-            if expire < std::time::Instant::now() {
+            if expire < crate::time::Instant::now() {
                 return SearchExit::Time;
             }
         }
@@ -774,6 +798,29 @@ fn parent_view<G: Gamestate<M>, M: Move>(child: &Node<G, M>, parent_aim: Negamax
     }
 }
 
+/// A source of randomness for breaking ties between equal root moves.
+///
+/// `rand::thread_rng` needs `getrandom`, which on `wasm32-unknown-unknown`
+/// only works through the wasm-bindgen JS shim. Tie-breaking does not need
+/// entropy of that quality, so on wasm the generator is seeded from the host
+/// clock and a call counter instead, which keeps the module free of imports
+/// beyond `now_ms`.
+#[cfg(target_arch = "wasm32")]
+fn tie_break_rng() -> rand::rngs::SmallRng {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use rand::SeedableRng;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let clock = crate::time::now_millis().to_bits();
+    rand::rngs::SmallRng::seed_from_u64(clock ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tie_break_rng() -> rand::rngs::ThreadRng {
+    rand::thread_rng()
+}
+
 /// Re-pick the root move among equally good alternatives.
 ///
 /// The search keeps the first move that beats the incumbent, so a
@@ -800,7 +847,7 @@ fn pick_root_move<G: Gamestate<M>, M: Move>(
         .find(|(m, _)| Some(m) == node.best.as_ref())
         .map(|(_, c)| arena.get(*c).search_depth)?;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = tie_break_rng();
 
     if opts.random_best {
         let tied: Vec<&M> = node
@@ -1060,7 +1107,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     id: NodeId,
     evaluator: &mut E,
     depth: u8,
-    expiration: Option<std::time::Instant>,
+    expiration: Option<crate::time::Instant>,
     aim: NegamaxAim,
     mut alpha: f32,
     mut beta: f32,
@@ -1092,7 +1139,7 @@ pub fn negamax_ab<G: Gamestate<M>, M: Move, E: Evaluate<G>>(
     } else {
         // Check expiration
         if let Some(expire) = expiration {
-            if expire < std::time::Instant::now() {
+            if expire < crate::time::Instant::now() {
                 return SearchExit::Time;
             }
         }
@@ -1939,6 +1986,7 @@ mod test {
             bounded.play_move(&b.best);
         }
     }
+
     /// A resumed search must honour `max_time` on its first pass.
     ///
     /// The guard that keeps a pass unbounded until there is something to
