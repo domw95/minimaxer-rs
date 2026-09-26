@@ -33,6 +33,22 @@ pub struct Node<G, M> {
 }
 
 impl<G, M> Node<G, M> {
+    /// The best move the deepest completed search found from this node.
+    ///
+    /// Re-rooting keeps it, so a host that has just played a move can answer
+    /// with the move the previous search already settled on rather than
+    /// waiting for a fresh pass to finish. That is what makes a bounded
+    /// response time possible without interrupting the search.
+    pub fn best_move(&self) -> Option<&M> {
+        self.best.as_ref()
+    }
+
+    /// Plies this node has been searched to.
+    pub fn searched_depth(&self) -> u8 {
+        self.search_depth
+    }
+
+
     pub fn new(gamestate: G) -> Self {
         Node {
             moves: Vec::new(),
